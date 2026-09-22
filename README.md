@@ -90,6 +90,7 @@ cp ~/.claude/skills/outline-docs/config.example.json ~/.outline/config.json
 R=~/.claude/skills/outline-docs/scripts/outline.ts
 
 bun $R collections
+bun $R collections create --name "Раздел" --permission read --no-sharing --icon terminal --yes
 bun $R tree --collection "Инструкции"
 bun $R search "подключение обмена"
 bun $R doc <id|url> --full --out /tmp/doc.md

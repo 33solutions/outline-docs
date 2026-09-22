@@ -290,6 +290,24 @@ async function resolveCollection(rm: Resolved, value: string): Promise<Collectio
   throw new UserError(`Коллекция "${value}" не найдена. Список: outline.ts collections`);
 }
 
+/**
+ * Планка проверки: клиентская — только там, где текст реально уходит наружу.
+ * Публикация делает документ видимым команде, а не клиенту, поэтому строгой её делает
+ * либо выдача публичной ссылки, либо принадлежность коллекции из clientCollections.
+ */
+async function audienceFor(rm: Resolved, collectionId: string | null | undefined): Promise<Audience> {
+  const marks = rm.clientCollections ?? [];
+  if (marks.length === 0 || !collectionId) return "internal";
+  const list = await collections(rm);
+  const collection = list.find((c) => c.id === collectionId);
+  if (!collection) return "internal";
+  return marks.some(
+    (mark) => mark === collection.id || collection.name.toLowerCase().includes(mark.toLowerCase()),
+  )
+    ? "client"
+    : "internal";
+}
+
 /** Принимает id, urlId или полный URL документа. */
 function documentRef(value: string): string {
   const trimmed = value.trim();
@@ -463,6 +481,10 @@ async function cmdWhoami(rm: Resolved, _args: Args): Promise<void> {
 }
 
 async function cmdCollections(rm: Resolved, args: Args): Promise<void> {
+  const action = args.positional[0];
+  if (action === "create") return cmdCollectionCreate(rm, args);
+  if (action === "update" || action === "set") return cmdCollectionUpdate(rm, args);
+
   const q = (str(args, "query") ?? args.positional[0] ?? "").toLowerCase();
   const list = (await collections(rm)).filter((c) => !q || c.name.toLowerCase().includes(q));
   emit(list, () =>
@@ -478,6 +500,86 @@ async function cmdCollections(rm: Resolved, args: Args): Promise<void> {
           ]),
         ]),
   );
+}
+
+/**
+ * Создание и настройка коллекции.
+ * permission: read — видят и читают все участники пространства, read_write — ещё и правят,
+ * none — только приглашённые. sharing управляет тем, можно ли выдавать публичные ссылки.
+ */
+async function cmdCollectionCreate(rm: Resolved, args: Args): Promise<void> {
+  const name = str(args, "name") ?? args.positional[1];
+  if (!name) throw new UserError('Нужно название: collections create --name "…"');
+
+  const permissionFlag = (str(args, "permission") ?? "read").toLowerCase();
+  const permission =
+    permissionFlag === "none" || permissionFlag === "private"
+      ? null
+      : permissionFlag === "read_write" || permissionFlag === "rw"
+        ? "read_write"
+        : "read";
+  const sharing = !bool(args, "no-sharing");
+
+  const body: Record<string, unknown> = { name, permission, sharing };
+  const description = (await readBody(args)) ?? str(args, "description");
+  if (description) body.description = description;
+  const icon = str(args, "icon");
+  if (icon) body.icon = icon;
+  const color = str(args, "color");
+  if (color) body.color = color;
+
+  checkOutgoing({ название: name, описание: description }, args, sharing ? "client" : "internal");
+
+  const preview =
+    `НОВАЯ КОЛЛЕКЦИЯ · инстанс ${rm.name}\n` +
+    table([
+      ["Название", name],
+      ["Иконка / цвет", `${icon ?? "—"} ${color ?? ""}`.trim()],
+      [
+        "Доступ",
+        permission === null
+          ? "только приглашённые"
+          : permission === "read_write"
+            ? "все сотрудники: чтение и правка"
+            : "все сотрудники: чтение",
+      ],
+      ["Публичные ссылки", sharing ? "разрешены" : "запрещены"],
+    ]) +
+    (description ? `\n\nОПИСАНИЕ:\n${RULE}\n${description.trim()}\n${RULE}` : "");
+  if (!requireConfirmation(args, preview)) return;
+
+  const collection = await api<Collection>(rm, "collections.create", body);
+  noCache = true; // список коллекций в кэше устарел
+  emit(collection, () => `Создана коллекция: ${collection.name}\nID: ${collection.id}`);
+}
+
+async function cmdCollectionUpdate(rm: Resolved, args: Args): Promise<void> {
+  const value = str(args, "collection") ?? args.positional[1];
+  if (!value) throw new UserError("Укажите коллекцию: collections update <имя|id> --permission read");
+  const collection = await resolveCollection(rm, value);
+
+  const body: Record<string, unknown> = { id: collection.id };
+  const permissionFlag = str(args, "permission");
+  if (permissionFlag) {
+    const low = permissionFlag.toLowerCase();
+    body.permission = low === "none" || low === "private" ? null : low === "read_write" || low === "rw" ? "read_write" : "read";
+  }
+  if (args.flags.has("sharing")) body.sharing = !bool(args, "no-sharing");
+  if (bool(args, "no-sharing")) body.sharing = false;
+  const name = str(args, "name");
+  if (name) body.name = name;
+  const description = str(args, "description");
+  if (description) body.description = description;
+  if (Object.keys(body).length === 1) throw new UserError("Нечего менять: --permission/--sharing/--no-sharing/--name/--description.");
+
+  const preview =
+    `ИЗМЕНЕНИЕ КОЛЛЕКЦИИ «${collection.name}» · инстанс ${rm.name}\n` +
+    table(Object.entries(body).filter(([k]) => k !== "id").map(([k, v]) => [k, String(v)]));
+  if (!requireConfirmation(args, preview)) return;
+
+  const updated = await api<Collection>(rm, "collections.update", body);
+  noCache = true;
+  emit(updated, () => `Коллекция обновлена: ${updated.name}`);
 }
 
 async function cmdTree(rm: Resolved, args: Args): Promise<void> {
@@ -584,8 +686,8 @@ async function cmdCreate(rm: Resolved, args: Args): Promise<void> {
   const collection = await resolveCollection(rm, collectionValue);
   const publish = bool(args, "publish");
 
-  // Публикуемый документ проверяем по клиентской планке, черновик — по внутренней.
-  checkOutgoing({ название: title, текст: text }, args, publish ? "client" : "internal");
+  // Планка — по коллекции: клиентские коллекции проверяются строго, внутренние — мягче.
+  checkOutgoing({ название: title, текст: text }, args, await audienceFor(rm, collection.id));
 
   const body: Record<string, unknown> = { title, text, collectionId: collection.id, publish };
   const parent = str(args, "parent");
@@ -620,8 +722,7 @@ async function cmdUpdate(rm: Resolved, args: Args): Promise<void> {
     throw new UserError("Нечего менять: задайте --file/--text/--title или --publish.");
   }
 
-  const audience: Audience = publish || current.publishedAt ? "client" : "internal";
-  checkOutgoing({ название: title, текст: text }, args, audience);
+  checkOutgoing({ название: title, текст: text }, args, await audienceFor(rm, current.collectionId));
 
   const body: Record<string, unknown> = { id: current.id };
   if (title !== undefined) body.title = title;
@@ -656,8 +757,8 @@ async function cmdPublish(rm: Resolved, args: Args): Promise<void> {
     return;
   }
 
-  // Публикация переводит текст в разряд видимого команде и клиентам — планка клиентская.
-  checkOutgoing({ название: doc.title, текст: doc.text }, args, "client");
+  // Публикация делает документ видимым команде: планка зависит от того, клиентская ли коллекция.
+  checkOutgoing({ название: doc.title, текст: doc.text }, args, await audienceFor(rm, doc.collectionId));
 
   const preview =
     `ПУБЛИКАЦИЯ ДОКУМЕНТА · инстанс ${rm.name}\n${docUrl(rm, doc)}\n` +
@@ -756,7 +857,10 @@ async function cmdMove(rm: Resolved, args: Args): Promise<void> {
   if (collection) body.collectionId = (await resolveCollection(rm, collection)).id;
   const parent = str(args, "parent");
   if (parent) body.parentDocumentId = documentRef(parent);
-  if (!collection && !parent) throw new UserError("Задайте --collection и/или --parent.");
+  // Порядок внутри родителя: Outline ожидает числовую позицию, а не строковый ключ.
+  const index = num(args, "index");
+  if (index !== undefined) body.index = index;
+  if (!collection && !parent && !index) throw new UserError("Задайте --collection, --parent и/или --index.");
 
   const preview = `ПЕРЕМЕЩЕНИЕ · ${doc.title}\n${docUrl(rm, doc)}\nКуда: ${collection ?? "та же коллекция"}${
     parent ? `, родитель ${documentRef(parent)}` : ""
@@ -832,6 +936,9 @@ function cmdHelp(): void {
   instances                         профили из конфига
   whoami                            кто я и в каком пространстве
   collections [строка]              коллекции
+  collections create --name "…" [--permission read|read_write|none] [--no-sharing]
+                                   [--icon имя] [--color #RRGGBB] [--description "…"] [--yes]
+  collections update <имя|id> [--permission …] [--no-sharing] [--name "…"] [--yes]
   tree [--collection X]             структура коллекции
   docs [--collection X] [--mine] [--limit N]
   search "фраза" [--collection X] [--limit N]
@@ -841,7 +948,7 @@ function cmdHelp(): void {
   create --title "…" (--file f | --text "…" | --stdin) [--collection X] [--parent <id>] [--publish] [--yes]
   update <id|url> [--title "…"] [--file f|--text "…"] [--append] [--publish] [--yes]
   publish <id|url> [--yes]          черновик → опубликован
-  move <id> [--collection X] [--parent <id>] [--yes]
+  move <id> [--collection X] [--parent <id>] [--index <номер>] [--yes]
   archive <id> [--yes] | delete <id> [--permanent] --yes
   export <id> --out файл.md
 

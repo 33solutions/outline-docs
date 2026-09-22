@@ -1,0 +1,52 @@
+name: Проверки
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Типы, самопроверка, аудит репозитория
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # аудит смотрит всю историю: публикация раскрывает её целиком
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Инструменты проверки типов
+        run: bun add -d typescript bun-types
+
+      - name: Проверка типов
+        run: bunx tsc --noEmit
+
+      - name: Самопроверка разбора ввода и правил
+        run: bun scripts/selftest.ts
+
+      - name: Аудит репозитория и истории
+        env:
+          # Список внутренних доменов организации хранится в секретах, а не в коде:
+          # иначе проверяющий файл сам раскрывает то, что ищет.
+          AUDIT_INTERNAL_DOMAINS: ${{ secrets.AUDIT_INTERNAL_DOMAINS }}
+          AUDIT_ALLOW: ${{ secrets.AUDIT_ALLOW }}
+        run: bun scripts/audit-repo.ts --history
+
+      - name: Справка CLI запускается
+        run: bun scripts/outline.ts help > /dev/null
+
+      - name: Версия и журнал изменений согласованы
+        run: |
+          VERSION="$(cat VERSION)"
+          if ! grep -q "^## ${VERSION} " CHANGELOG.md; then
+            echo "В CHANGELOG.md нет секции '## ${VERSION}' — опишите изменения перед релизом." >&2
+            exit 1
+          fi
+          echo "Версия ${VERSION} описана в журнале изменений."

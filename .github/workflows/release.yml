@@ -1,0 +1,138 @@
+name: Релиз
+
+# Релиз выпускается сам: достаточно изменить файл VERSION в ветке main.
+# Тег и запись в разделе Releases создаются автоматически, если такого тега ещё нет.
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Ручной запуск и push одной и той же версии не должны бежать наперегонки:
+# второй иначе падает на уже созданном теге.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Проверить, собрать и опубликовать
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Версия и наличие тега
+        id: meta
+        run: |
+          VERSION="$(cat VERSION)"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          # Смотрим и локально, и на стороне сервера: тег мог появиться параллельным запуском.
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null ||
+             [ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Тег ${TAG} уже существует — релиз пропускается."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Готовим релиз ${TAG}."
+          fi
+
+      - name: Проверки перед публикацией
+        if: steps.meta.outputs.exists == 'false'
+        env:
+          # Список внутренних доменов организации хранится в секретах, а не в коде:
+          # иначе проверяющий файл сам раскрывает то, что ищет.
+          AUDIT_INTERNAL_DOMAINS: ${{ secrets.AUDIT_INTERNAL_DOMAINS }}
+          AUDIT_ALLOW: ${{ secrets.AUDIT_ALLOW }}
+        run: |
+          bun add -d typescript bun-types
+          bunx tsc --noEmit
+          bun scripts/selftest.ts
+          bun scripts/audit-repo.ts --history
+
+      - name: Заметки к релизу из журнала изменений
+        if: steps.meta.outputs.exists == 'false'
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          awk -v v="## ${VERSION} " '
+            index($0, v) == 1 { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "В CHANGELOG.md нет секции для ${VERSION}." >&2
+            exit 1
+          fi
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "Установка:"
+            echo ""
+            echo '```bash'
+            echo "git clone https://github.com/${GITHUB_REPOSITORY}.git ~/.claude/skills/redmine-time"
+            echo '```'
+            echo ""
+            echo "Обновление уже установленного скилла:"
+            echo ""
+            echo '```bash'
+            echo "bun ~/.claude/skills/redmine-time/scripts/update.ts --apply"
+            echo '```'
+          } >> RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Инструкция в PDF
+        if: steps.meta.outputs.exists == 'false'
+        run: |
+          # PDF не хранится в репозитории: он собирается из docs/instruction.html,
+          # поэтому опубликованный файл всегда соответствует опубликованному исходнику.
+          CHROME=""
+          for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then CHROME="$candidate"; break; fi
+          done
+          if [ -z "$CHROME" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq chromium-browser
+            CHROME=chromium-browser
+          fi
+          "$CHROME" --headless=new --disable-gpu --no-sandbox --no-pdf-header-footer \
+            --print-to-pdf="$PWD/redmine-time-instruction.pdf" "file://$PWD/docs/instruction.html"
+          ls -lh redmine-time-instruction.pdf
+
+      - name: Архив скилла
+        if: steps.meta.outputs.exists == 'false'
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          STAGE="$(mktemp -d)/redmine-time"
+          mkdir -p "$STAGE"
+          git archive HEAD | tar -x -C "$STAGE"
+          rm -rf "$STAGE/.github"
+          cp redmine-time-instruction.pdf "$STAGE/docs/instruction.pdf"
+          (cd "$(dirname "$STAGE")" && zip -qr "$GITHUB_WORKSPACE/redmine-time-${TAG}.zip" redmine-time)
+          unzip -l "redmine-time-${TAG}.zip"
+
+      - name: Тег и публикация
+        if: steps.meta.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "redmine-time $TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" \
+            --title "redmine-time $TAG" \
+            --notes-file RELEASE_NOTES.md \
+            --target "$GITHUB_SHA" \
+            "redmine-time-${TAG}.zip" \
+            "redmine-time-instruction.pdf"

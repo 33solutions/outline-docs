@@ -1,0 +1,15 @@
+{
+  "default": "work",
+  "instances": {
+    "work": {
+      "url": "https://outline.example.com/",
+      "apiKey": "",
+      "defaultCollection": "Инструкции",
+      "clientCollections": ["Документация для клиентов"]
+    }
+  },
+  "audit": {
+    "internalDomains": [],
+    "allow": []
+  }
+}

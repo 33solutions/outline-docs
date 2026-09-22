@@ -80,13 +80,13 @@ jobs:
             echo "Установка:"
             echo ""
             echo '```bash'
-            echo "git clone https://github.com/${GITHUB_REPOSITORY}.git ~/.claude/skills/redmine-time"
+            echo "git clone https://github.com/${GITHUB_REPOSITORY}.git ~/.claude/skills/outline-docs"
             echo '```'
             echo ""
             echo "Обновление уже установленного скилла:"
             echo ""
             echo '```bash'
-            echo "bun ~/.claude/skills/redmine-time/scripts/update.ts --apply"
+            echo "bun ~/.claude/skills/outline-docs/scripts/update.ts --apply"
             echo '```'
           } >> RELEASE_NOTES.md
           cat RELEASE_NOTES.md
@@ -96,6 +96,10 @@ jobs:
         run: |
           # PDF не хранится в репозитории: он собирается из docs/instruction.html,
           # поэтому опубликованный файл всегда соответствует опубликованному исходнику.
+          if [ ! -f docs/instruction.html ]; then
+            echo "docs/instruction.html нет — шаг пропускается, релиз соберётся без PDF."
+            exit 0
+          fi
           CHROME=""
           for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
             if command -v "$candidate" >/dev/null 2>&1; then CHROME="$candidate"; break; fi
@@ -105,20 +109,23 @@ jobs:
             CHROME=chromium-browser
           fi
           "$CHROME" --headless=new --disable-gpu --no-sandbox --no-pdf-header-footer \
-            --print-to-pdf="$PWD/redmine-time-instruction.pdf" "file://$PWD/docs/instruction.html"
-          ls -lh redmine-time-instruction.pdf
+            --print-to-pdf="$PWD/outline-docs-instruction.pdf" "file://$PWD/docs/instruction.html"
+          ls -lh outline-docs-instruction.pdf
 
       - name: Архив скилла
         if: steps.meta.outputs.exists == 'false'
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
-          STAGE="$(mktemp -d)/redmine-time"
+          STAGE="$(mktemp -d)/outline-docs"
           mkdir -p "$STAGE"
           git archive HEAD | tar -x -C "$STAGE"
           rm -rf "$STAGE/.github"
-          cp redmine-time-instruction.pdf "$STAGE/docs/instruction.pdf"
-          (cd "$(dirname "$STAGE")" && zip -qr "$GITHUB_WORKSPACE/redmine-time-${TAG}.zip" redmine-time)
-          unzip -l "redmine-time-${TAG}.zip"
+          if [ -f outline-docs-instruction.pdf ]; then
+            mkdir -p "$STAGE/docs"
+            cp outline-docs-instruction.pdf "$STAGE/docs/instruction.pdf"
+          fi
+          (cd "$(dirname "$STAGE")" && zip -qr "$GITHUB_WORKSPACE/outline-docs-${TAG}.zip" outline-docs)
+          unzip -l "outline-docs-${TAG}.zip"
 
       - name: Тег и публикация
         if: steps.meta.outputs.exists == 'false'
@@ -126,13 +133,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
+          ASSETS=""
+          [ -f outline-docs-instruction.pdf ] && ASSETS="outline-docs-instruction.pdf"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "redmine-time $TAG"
+          git tag -a "$TAG" -m "outline-docs $TAG"
           git push origin "$TAG"
           gh release create "$TAG" \
-            --title "redmine-time $TAG" \
+            --title "outline-docs $TAG" \
             --notes-file RELEASE_NOTES.md \
             --target "$GITHUB_SHA" \
-            "redmine-time-${TAG}.zip" \
-            "redmine-time-instruction.pdf"
+            "outline-docs-${TAG}.zip" \
+            $ASSETS

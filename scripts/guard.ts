@@ -53,9 +53,20 @@ function isPlaceholder(value: string): boolean {
  */
 const SECRET_CHARS = /^[A-Za-z0-9_\-+/=.!@#$%^&*~]{8,}$/;
 
+/** Похожее по форме, но реквизитом не являющееся: размеры, даты, версии, время, диапазоны. */
+const NOT_SECRET = [
+  /^\d+[xх*×]\d+$/i, // размеры изображений
+  /^\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}$/, // даты
+  /^v?\d+(?:\.\d+)+$/i, // версии
+  /^\d{1,2}:\d{2}(?::\d{2})?$/, // время
+  /^\d+[-–]\d+$/, // диапазоны
+  /^[A-Za-z]+\d{1,4}$/, // короткие обозначения вида BUG001, P4618
+];
+
 function looksLikeSecret(token: string): boolean {
-  const clean = token.replace(/^[*_`"'<[({]+/, "").replace(/[*_`"'>\])},.;:!?]+$/, "");
+  const clean = token.replace(/^[*_`"'<[({|]+/, "").replace(/[*_`"'>\])},.;:!?|]+$/, "").trim();
   if (!SECRET_CHARS.test(clean)) return false;
+  if (NOT_SECRET.some((re) => re.test(clean))) return false;
   return (/\d/.test(clean) && /[A-Za-z]/.test(clean)) || clean.length >= 24;
 }
 
@@ -179,6 +190,19 @@ const RULES: Rule[] = [
       if (isPlaceholder(tail.replace(/["'`]/g, "").replace(/[.,;:!?)]+$/, ""))) return false;
       return containsSecret(tail);
     },
+  },
+  {
+    id: "credential-near-keyword",
+    title: "Реквизит доступа рядом со словом «пароль» или «ключ»",
+    severity: "block",
+    // Ловит то, что не укладывается в «пароль: значение»: таблицы с колонкой «Пароль»,
+    // списки логинов, значение строкой ниже ключевого слова.
+    pattern: new RegExp(
+      `${L}(?:парол[ьяием]*|password|passwd|pwd|ключ доступа|api[ _-]?key|apikey|токен\\p{L}*|token|secret|секрет\\p{L}*)[\\s\\S]{0,200}`,
+      "giu",
+    ),
+    hint: "Учётные данные хранятся в менеджере секретов; в документе оставляют ссылку на него.",
+    accept: (m) => containsSecret(m[0].replace(/^[^\s|:=]+/, "")),
   },
   {
     id: "hex-secret",

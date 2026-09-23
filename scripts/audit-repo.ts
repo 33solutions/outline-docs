@@ -91,6 +91,25 @@ const INTERNAL_PATTERNS: { pattern: RegExp; title: string }[] = (auditConfig.int
 /** Контексты, в которых совпадение допустимо (например, адрес самого репозитория). */
 const INTERNAL_ALLOW = (auditConfig.allow ?? []).map((source) => new RegExp(source, "i"));
 
+/**
+ * Ссылка скилла на собственную страницу в базе знаний — не утечка, а правило: SKILL.md обязан
+ * называть страницу, которая обновляется вместе с версией. Страница опознаётся по пути
+ * «/doc/<имя скилла>-…»: база знаний строит адрес из названия, а название страницы начинается
+ * с имени скилла. Любое другое упоминание внутреннего домена — по-прежнему находка, и список
+ * разрешений в секрете для этого не нужен (его значения не прочитать, а перезапись стёрла бы их).
+ */
+const SKILL_NAME = await (async (): Promise<string | null> => {
+  const file = Bun.file("SKILL.md");
+  if (!(await file.exists())) return null;
+  const head = (await file.text()).match(/^---\s*\n([\s\S]*?)\n---/);
+  const name = head?.[1]?.match(/^name:\s*["']?([\w.-]+)["']?\s*$/m)?.[1];
+  return name ?? null;
+})();
+
+function isSelfLink(text: string, matchEnd: number): boolean {
+  return SKILL_NAME !== null && text.startsWith(`/doc/${SKILL_NAME}-`, matchEnd);
+}
+
 async function sh(command: string[]): Promise<string> {
   const proc = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
   const out = await new Response(proc.stdout).text();
@@ -155,6 +174,7 @@ for (const file of files) {
     while ((m = re.exec(text)) !== null) {
       const around = text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 20);
       if (INTERNAL_ALLOW.some((re) => re.test(around))) continue;
+      if (isSelfLink(text, m.index + m[0].length)) continue;
       const line = text.slice(0, m.index).split("\n").length;
       problems.push({ file, line, title, detail: m[0] });
     }
@@ -206,6 +226,7 @@ if (process.argv.includes("--history")) {
       while ((m = re.exec(text)) !== null) {
         const around = text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 20);
         if (INTERNAL_ALLOW.some((re) => re.test(around))) continue;
+        if (isSelfLink(text, m.index + m[0].length)) continue;
         const line = text.slice(0, m.index).split("\n").length;
         problems.push({ file: `история ${where}`, line, title, detail: m[0] });
       }

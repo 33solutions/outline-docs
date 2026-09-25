@@ -5,10 +5,16 @@ description: "База знаний Outline из чата: найти докум
 
 # Outline: база знаний, инструкции и ссылки клиентам
 
+> **Где лежит скрипт.** Каталог этого скилла сообщается при его загрузке строкой
+> `Base directory for this skill:`. При установке из витрины плагинов он внутри
+> `~/.claude/plugins/cache/<витрина>/<скилл>/<версия>/skills/<скилл>`, при разработке —
+> `~/.claude/skills/<скилл>`. Ниже он обозначен как `<каталог скилла>`: подставляйте тот,
+> что указан при загрузке, а не угадывайте.
+
 Скилл ведёт базу знаний как редактор, а не как транспорт: формулирует документы по стандарту, проверяет их перед тем, как они станут видны клиенту, и ничего не отправляет без подтверждения.
 
 ```bash
-bun ~/.claude/skills/outline-docs/scripts/outline.ts <команда> [флаги]
+bun <каталог скилла>/scripts/outline.ts <команда> [флаги]
 ```
 
 `... help` — полный список команд. Инстансы и коллекции по умолчанию берутся из `~/.outline/config.json`, профили видно командой `... instances`.
@@ -114,7 +120,7 @@ bun ~/.claude/skills/outline-docs/scripts/outline.ts <команда> [флаг�
 Обновляется сам раз в сутки при старте сессии (hook `SessionStart`). Вручную:
 
 ```bash
-bun ~/.claude/skills/outline-docs/scripts/update.ts --apply
+bun <каталог скилла>/scripts/update.ts --apply
 ```
 
 Локальные правки в папке скилла не затираются.
@@ -131,9 +137,9 @@ bun ~/.claude/skills/outline-docs/scripts/update.ts --apply
 Обновляется она навыком `outline-docs`:
 
 ```bash
-bun ~/.claude/skills/outline-docs/scripts/outline.ts doc <id> --full --out /tmp/doc.md   # взять текущий текст
+bun <каталог скилла>/scripts/outline.ts doc <id> --full --out /tmp/doc.md   # взять текущий текст
 # ... правка ...
-bun ~/.claude/skills/outline-docs/scripts/outline.ts update <id> --file /tmp/doc.md --yes
+bun <каталог скилла>/scripts/outline.ts update <id> --file /tmp/doc.md --yes
 ```
 
 Что обновлять: перечень возможностей, форматы, ограничения и раздел диагностики. Мелкие правки внутри существующих команд страницу не трогают — она о том, что скилл умеет, а не о том, как он устроен внутри.

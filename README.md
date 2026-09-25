@@ -44,9 +44,14 @@ CLI на [Bun](https://bun.sh) и TypeScript: нулевые зависимос�
 
 Нужны [Claude Code](https://claude.com/claude-code) и [Bun](https://bun.sh) ≥ 1.2.
 
-```bash
-git clone https://github.com/33solutions/outline-docs.git ~/.claude/skills/outline-docs
 ```
+/plugin marketplace add 33solutions/claude-skills
+/plugin install outline-docs@33solutions
+```
+
+Витрина закрытая: нужен доступ к репозиторию скилла. Обновление — `/plugin update outline-docs@33solutions`.
+
+Разработка идёт клонированием в отдельный каталог; при таком способе пути внутри скилла остаются прежними.
 
 ## Настройка
 

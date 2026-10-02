@@ -357,6 +357,14 @@ async function runOutlineScenarios(work: string, servers: ReturnType<typeof Bun.
   const sharedBefore = addDoc(34, "Shared0034", { title: "Ссылку снимали" });
   addShare(972, { documentId: sharedBefore.id, published: false });
   const stubborn = addDoc(35, "Stubborn35", { title: "Вложенные открываются всегда", stubbornChildren: true });
+  // Для проверки поддерева: ссылка с --children открывает и вложенные, значит планка на них та же.
+  const treeRoot = addDoc(36, "TreeRoot36", { title: "Раздел с вложенными" });
+  addDoc(37, "TreeOk0037", { title: "Вложенный чистый", parentDocumentId: treeRoot.id });
+  addDoc(38, "TreeBad038", {
+    title: "Вложенный с внутренним адресом",
+    parentDocumentId: treeRoot.id,
+    text: "# Доступ\n\nЛоги сняты с сервера 10.0.0.5, смотреть там.",
+  });
   let nextShare = 980;
 
   const log: Logged[] = [];
@@ -487,6 +495,19 @@ async function runOutlineScenarios(work: string, servers: ReturnType<typeof Bun.
         return doc
           ? json(200, { ok: true, data: present(doc) })
           : json(404, { ok: false, error: "not_found", message: "Resource not found" });
+      }
+      // Дерево коллекции: отсюда скилл берёт поддерево документа перед выдачей ссылки с --children.
+      case "/api/collections.documents": {
+        // docs хранит каждый документ дважды — под id и под urlId; без дедупликации дерево удвоится.
+        const all = [...new Map([...docs.values()].map((d) => [d.id, d])).values()];
+        const node = (d: FakeDoc): unknown => ({
+          id: d.id,
+          title: d.title,
+          url: `/doc/${d.urlId}`,
+          children: all.filter((c) => c.parentDocumentId === d.id).map(node),
+        });
+        const roots = all.filter((d) => d.collectionId === String(body.id) && !d.parentDocumentId);
+        return json(200, { ok: true, data: roots.map(node) });
       }
       case "/api/collections.list":
         return json(200, { ok: true, data: collectionsList, pagination: { offset: 0, limit: 100 } });
@@ -1204,6 +1225,27 @@ async function runOutlineScenarios(work: string, servers: ReturnType<typeof Bun.
     [widening.code, widening.out.includes("после записи откроются и все вложенные")],
     [0, true],
   );
+  // Поддерево проверяется по той же клиентской планке, и находка останавливает выдачу ссылки.
+  const dirtyTree = await cli("share", treeRoot.urlId, "--children", "--yes");
+  check(
+    "share --children: находка во вложенном документе останавливает выдачу",
+    [dirtyTree.code, dirtyTree.err.includes("Остановлено"), dirtyTree.err.includes("Вложенный с внутренним адресом")],
+    [1, true, true],
+  );
+  check("share --children: остановлено до выдачи ссылки", shareUpdates(dirtyTree.requests).length, 0);
+  const dirtyForced = await cli("share", treeRoot.urlId, "--children", "--yes", "--override-guard");
+  check(
+    "share --children --override-guard: ссылка выдаётся, обход назван вслух",
+    [dirtyForced.code, shareUpdates(dirtyForced.requests).length, dirtyForced.err.includes("ПРОВЕРКА ПОДДЕРЕВА ОБОЙДЕНА")],
+    [0, 1, true],
+  );
+  const dirtyAlone = await cli("share", addDoc(39, "TreeRoot39", { title: "Раздел с вложенными, без флага" }).urlId, "--yes");
+  check(
+    "share без --children: поддерево не проверяется — ссылка открывает только сам документ",
+    [dirtyAlone.code, shareUpdates(dirtyAlone.requests).length],
+    [0, 1],
+  );
+
   const reopening = await cli("share", sharedBefore.urlId);
   check(
     "share, ссылка снята с публикации: предпросмотр — прежний адрес снова откроется",

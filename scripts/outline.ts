@@ -1646,6 +1646,71 @@ async function cmdPublish(rm: Resolved, args: Args): Promise<void> {
  * сам документ, с --children — и все вложенные. После записи ссылка перечитывается и сверяется
  * с запрошенным: вложенные, открытые вопреки просьбе, — утечка наружу, о ней сказано прямо, код 1.
  */
+/** Сколько вложенных документов скилл берётся проверить за одну выдачу ссылки. */
+const MAX_SUBTREE_CHECK = 100;
+
+/**
+ * Поддерево документа, плоским списком и сверху вниз. Берётся из дерева коллекции
+ * (collections.documents): отдельного вызова «дай вложенные» в Outline нет.
+ */
+async function subtreeDocuments(rm: Resolved, doc: Doc): Promise<DocumentRef[]> {
+  if (!doc.collectionId) return [];
+  const nodes = await api<DocumentRef[]>(rm, "collections.documents", { id: doc.collectionId });
+  const find = (list: DocumentRef[]): DocumentRef | null => {
+    for (const node of list) {
+      if (node.id === doc.id) return node;
+      const hit = node.children?.length ? find(node.children) : null;
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const out: DocumentRef[] = [];
+  const collect = (list: DocumentRef[]): void => {
+    for (const node of list) {
+      out.push(node);
+      if (node.children?.length) collect(node.children);
+    }
+  };
+  const self = find(nodes);
+  if (self?.children?.length) collect(self.children);
+  return out;
+}
+
+/**
+ * Ссылка с --children открывает каждый вложенный документ, значит клиентская планка применяется
+ * ко всему поддереву, а не к одному корню. Прежде здесь стояло предупреждение в предпросмотре:
+ * проверка, не влияющая на решение, — это надпись, а не проверка. Отказ выдаётся ДО shares.create —
+ * невыданная ссылка и отозванная различаются тем, что между ними кто-то успевает перейти.
+ */
+async function checkSubtree(rm: Resolved, args: Args, refs: DocumentRef[]): Promise<string[]> {
+  if (refs.length > MAX_SUBTREE_CHECK && !bool(args, "override-guard")) {
+    throw new UserError(
+      `Остановлено: во вложенных документах ${refs.length} штук, скилл проверяет не больше ${MAX_SUBTREE_CHECK}.\n` +
+        `  Непроверенное поддерево наружу не открывают: ссылка откроет и то, чего никто не читал.\n` +
+        `  Выдайте ссылку без --children либо повторите с --override-guard, если поддерево прочитано глазами.`,
+    );
+  }
+  const blocked: string[] = [];
+  const warned: string[] = [];
+  for (const ref of refs) {
+    const child = await loadDoc(rm, ref.id);
+    const result = guard({ название: child.title, текст: child.text }, { audience: "client" });
+    if (result.findings.length === 0) continue;
+    const entry = `  ${docUrl(rm, child)} — «${child.title}»\n${result.report}`;
+    (result.blocked ? blocked : warned).push(entry);
+  }
+  if (blocked.length && !bool(args, "override-guard")) {
+    throw new UserError(
+      `Остановлено: ссылка с --children открывает вложенных документов — ${refs.length}, ` +
+        `и в ${blocked.length} из них есть то, чего наружу отдавать нельзя.\n${blocked.join("\n")}\n` +
+        `  Исправьте эти документы. Если находки ложные — повторите с --override-guard.`,
+    );
+  }
+  if (blocked.length) console.error(`ПРОВЕРКА ПОДДЕРЕВА ОБОЙДЕНА (--override-guard):\n${blocked.join("\n")}`);
+  if (warned.length) console.error(`Предупреждения по вложенным документам:\n${warned.join("\n")}`);
+  return [...blocked, ...warned];
+}
+
 async function cmdShare(rm: Resolved, args: Args): Promise<void> {
   const value = args.positional[0] ?? str(args, "id");
   if (!value) throw new UserError("Укажите документ: outline.ts share <id|url>");
@@ -1654,6 +1719,10 @@ async function cmdShare(rm: Resolved, args: Args): Promise<void> {
 
   // Ссылка делает документ доступным всем, у кого она есть, — это публикация наружу.
   checkOutgoing({ название: doc.title, текст: doc.text }, args, "client");
+
+  // С --children ссылка открывает и вложенные: планка применяется ко всему поддереву.
+  const subtree = withChildren ? await subtreeDocuments(rm, doc) : [];
+  const subtreeFindings = subtree.length ? await checkSubtree(rm, args, subtree) : [];
 
   // Второй ссылки на документ shares.create не выдаёт: свою, не отозванную, он возвращает как есть,
   // и запись меняет её. Поэтому предпросмотр говорит, что в ней сейчас и что поменяется.
@@ -1683,7 +1752,13 @@ async function cmdShare(rm: Resolved, args: Args): Promise<void> {
     );
   }
   if (withChildren) {
-    warnings.push("текст вложенных документов в предпросмотр не входит и не проверялся — прочитайте их до выдачи");
+    warnings.push(
+      subtree.length === 0
+        ? "вложенных документов нет — ссылка откроет только сам документ, несмотря на --children"
+        : `вложенных документов ${subtree.length}, все проверены по клиентской планке; ` +
+          `находок, не остановивших выдачу, — ${subtreeFindings.length}. ` +
+          "Их текст в предпросмотр не входит — прочитайте перед выдачей",
+    );
   }
   for (const link of links?.inherited ?? []) warnings.push(`документ уже открыт без входа: ${linkOrigin(link)} — ${link.share.url}`);
   if (links?.ownHidden) {
@@ -1705,7 +1780,10 @@ async function cmdShare(rm: Resolved, args: Args): Promise<void> {
           : `уже есть: ${existing.url} — ` +
             (existing.published ? `открывает ${opens(existing.includeChildDocuments === true)}` : "снята с публикации"),
       ],
-      ["Вложенные документы", withChildren ? "включены в ссылку" : "не включены"],
+      [
+        "Вложенные документы",
+        withChildren ? `включены — ${subtree.length}, проверены по клиентской планке` : "не включены",
+      ],
       ["Кто увидит", "любой, у кого есть ссылка, без входа в Outline"],
     ]) +
     (warnings.length ? `\n\nВнимание:\n${warnings.map((w) => `  — ${w}`).join("\n")}` : "") +
@@ -2397,7 +2475,9 @@ function cmdHelp(): void {
 
 Ссылки для клиентов
   share <id|url> [--children] [--yes]   выдать публичную ссылку: без --children — только сам документ,
-                                        с --children — и все вложенные; после записи сверяется
+                                        с --children — и все вложенные, и тогда поддерево читается
+                                        и проверяется: находка отказывает в выдаче (--override-guard
+                                        снимает); после записи ссылка сверяется
   shares [--document <id|url>]          что выдано: просмотры и последнее обращение; по документу —
                                         своя ссылка и унаследованные (на коллекцию, на родителя)
   unshare <docId|shareId|url> [--yes]   отозвать ссылку; по документу — только его собственную,

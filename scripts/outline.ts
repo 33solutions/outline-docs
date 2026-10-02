@@ -1,13 +1,14 @@
 #!/usr/bin/env bun
 /**
- * Outline CLI — база знаний: документы, публикация, ссылки для клиентов.
+ * Outline CLI — база знаний: документы, публикация, ссылки для клиентов, вложения.
  * Bun + TypeScript, нулевые зависимости, нативный fetch.
  *
  * Конфиг: ~/.outline/config.json (профили инстансов), env имеет приоритет.
  * Запись требует явного --yes: без него команда печатает предпросмотр и выходит.
  */
 
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { mkdir, readdir, rename, rm as removePath, stat, writeFile } from "node:fs/promises";
 import { guard, scanText, formatFindings, type Audience, type Finding } from "./guard.ts";
 
 // ─────────────────────────────── конфиг ───────────────────────────────
@@ -42,6 +43,8 @@ class ApiError extends Error {
     readonly code: string,
     readonly details: string,
     readonly method: string,
+    /** Сообщение сервера как есть: по нему отличают, например, ограничение ключа от нехватки прав. */
+    readonly serverMessage = "",
   ) {
     super(`${method} → ${status} ${code}${details ? `: ${details}` : ""}`);
   }
@@ -160,6 +163,7 @@ async function api<T>(rm: Resolved, method: string, body: Record<string, unknown
 
   if (!res.ok || (isRecord(parsed) && parsed.ok === false)) {
     const code = isRecord(parsed) && typeof parsed.error === "string" ? parsed.error : `http_${res.status}`;
+    const serverMessage = isRecord(parsed) && typeof parsed.message === "string" ? parsed.message : "";
     let details = isRecord(parsed) && typeof parsed.message === "string" ? parsed.message : text.slice(0, 200);
     if (code === "authentication_required" || res.status === 401) {
       details = "токен неверен или отозван — перевыпустите его в Настройки → API";
@@ -168,7 +172,7 @@ async function api<T>(rm: Resolved, method: string, body: Record<string, unknown
       details = `недостаточно прав у владельца токена: ${details}`;
     }
     if (res.status === 404) details = `объект не найден: ${details}`;
-    throw new ApiError(res.status, code, details, method);
+    throw new ApiError(res.status, code, details, method, serverMessage);
   }
 
   if (!isRecord(parsed)) return undefined as T;
@@ -301,11 +305,14 @@ async function audienceFor(rm: Resolved, collectionId: string | null | undefined
   const list = await collections(rm);
   const collection = list.find((c) => c.id === collectionId);
   if (!collection) return "internal";
-  return marks.some(
+  return isClientCollection(rm, collection) ? "client" : "internal";
+}
+
+/** Коллекция помечена в clientCollections — по id или по части названия. */
+function isClientCollection(rm: Resolved, collection: Pick<Collection, "id" | "name">): boolean {
+  return (rm.clientCollections ?? []).some(
     (mark) => mark === collection.id || collection.name.toLowerCase().includes(mark.toLowerCase()),
-  )
-    ? "client"
-    : "internal";
+  );
 }
 
 /** Принимает id, urlId или полный URL документа. */
@@ -320,12 +327,23 @@ function documentRef(value: string): string {
 
 // ────────────────────────────── argv ──────────────────────────────────
 
-type Args = { cmd: string; positional: string[]; flags: Map<string, string | true> };
+type Args = {
+  cmd: string;
+  positional: string[];
+  flags: Map<string, string | true>;
+  /** Все флаги по порядку, с повторами: flags хранит только последнее значение, а attach --file/--url повторяемы. */
+  all: [string, string | true][];
+};
 
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
   const flags = new Map<string, string | true>();
+  const all: [string, string | true][] = [];
   const short: Record<string, string> = { i: "instance", c: "collection", q: "query", n: "limit", f: "file" };
+  const put = (name: string, value: string | true): void => {
+    flags.set(name, value);
+    all.push([name, value]);
+  };
 
   for (let index = 0; index < argv.length; index++) {
     const token = argv[index]!;
@@ -333,31 +351,31 @@ function parseArgs(argv: string[]): Args {
       const body = token.slice(2);
       const eq = body.indexOf("=");
       if (eq !== -1) {
-        flags.set(body.slice(0, eq), body.slice(eq + 1));
+        put(body.slice(0, eq), body.slice(eq + 1));
         continue;
       }
       const next = argv[index + 1];
       if (next !== undefined && !next.startsWith("--")) {
-        flags.set(body, next);
+        put(body, next);
         index++;
       } else {
-        flags.set(body, true);
+        put(body, true);
       }
     } else if (/^-[a-z]$/i.test(token)) {
       const name = short[token[1]!] ?? token[1]!;
       const next = argv[index + 1];
       if (next !== undefined && !next.startsWith("-")) {
-        flags.set(name, next);
+        put(name, next);
         index++;
       } else {
-        flags.set(name, true);
+        put(name, true);
       }
     } else {
       positional.push(token);
     }
   }
   const cmd = positional.shift() ?? "help";
-  return { cmd, positional, flags };
+  return { cmd, positional, flags, all };
 }
 
 const str = (args: Args, name: string): string | undefined => {
@@ -445,6 +463,783 @@ async function readBody(args: Args): Promise<string | undefined> {
   if (inline !== undefined) return inline;
   if (bool(args, "stdin")) return new Response(Bun.stdin.stream()).text();
   return undefined;
+}
+
+// ─────────────────── вложения: файлы, ссылки, разметка ────────────────
+//
+// Файлы прикладывает сам человек своим ключом из конфига: Outline сам проверяет его право
+// на правку документа, а в истории правок остаётся его имя. Служебного ключа у скилла нет.
+
+/**
+ * Копии файлов, скачанных по --url. Ссылки одноразовые и короткоживущие: предпросмотр скачивает
+ * файл сразу (иначе не показать имя и размер, а без них — и текст, который уйдёт в документ),
+ * и запись с --yes берёт байты отсюда, а не со ссылки, которая второй раз уже не откроется.
+ */
+const DOWNLOAD_DIR = join(CONFIG_DIR, "downloads");
+/** Копия живёт до записи; неподтверждённая удаляется через час при следующем запуске скрипта. */
+const DOWNLOAD_TTL_MS = 60 * 60 * 1000;
+const DOWNLOAD_TIMEOUT_MS = 3 * 60 * 1000;
+const UPLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_MAX_MB = 100;
+const MAX_REDIRECTS = 5;
+/** attachments.create в Outline ограничен 25 вызовами в минуту. */
+const MAX_FILES = 20;
+const UPDATE_ATTEMPTS = 5;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Картинкой — то, что браузер покажет в тексте документа; tiff, heic и прочее — вложением. */
+const INLINE_IMAGE_RE = /^image\/(?:png|jpeg|gif|webp|avif|bmp|svg\+xml)$/;
+
+type AttachSource = { kind: "file" | "url"; value: string };
+
+type PreparedFile = {
+  kind: "file" | "url";
+  name: string;
+  size: number;
+  contentType: string;
+  /** Где лежат байты: файл пользователя или локальная копия скачанного. */
+  path: string;
+  /** Что можно показывать: путь к файлу или хост и путь ссылки — без строки запроса. */
+  origin: string;
+  /** Скачанный файл взят из копии, сделанной предпросмотром. */
+  cached?: boolean;
+  /** Ключ локальной копии — чтобы удалить её после записи. */
+  cacheKey?: string;
+};
+
+/**
+ * Строки, которые нельзя напечатать ни при каких условиях: ссылки --url целиком, их строка запроса
+ * и значения параметров — в них одноразовый токен. Сообщения строятся из хоста и пути, а это —
+ * последний рубеж для текста ошибок, пришедшего не от нас.
+ */
+const SECRET_STRINGS = new Set<string>();
+
+function rememberSecret(url: URL, raw?: string): void {
+  if (raw) SECRET_STRINGS.add(raw);
+  SECRET_STRINGS.add(url.href);
+  if (url.search.length > 1) SECRET_STRINGS.add(url.search.slice(1));
+  for (const value of url.searchParams.values()) if (value.length >= 6) SECRET_STRINGS.add(value);
+  if (url.password) SECRET_STRINGS.add(url.password);
+}
+
+function redact(text: string): string {
+  let out = text;
+  for (const secret of [...SECRET_STRINGS].sort((a, b) => b.length - a.length)) {
+    if (secret) out = out.split(secret).join("…");
+  }
+  return out;
+}
+
+/** Хост и путь — всё, что можно показать из ссылки. */
+function safeUrl(url: URL): string {
+  return `${url.host}${url.pathname}`;
+}
+
+/** Только https: файл не должен идти по сети открытым текстом. */
+function parseDownloadUrl(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new UserError("--url: это не адрес. Передайте ссылку целиком, как её выдал инструмент.");
+  }
+  rememberSecret(url, raw);
+  if (url.protocol !== "https:") {
+    throw new UserError(
+      `--url принимает только https-ссылки, а ссылка на ${safeUrl(url)} — ${url.protocol.replace(":", "")}: ` +
+        `файл шёл бы по сети открытым текстом. Попросите https-ссылку.`,
+    );
+  }
+  return url;
+}
+
+/** Байты из %XX, остальное — как UTF-8. */
+function percentBytes(text: string): Uint8Array {
+  const out: number[] = [];
+  const encoder = new TextEncoder();
+  for (const part of text.split(/(%[0-9A-Fa-f]{2})/)) {
+    if (/^%[0-9A-Fa-f]{2}$/.test(part)) out.push(parseInt(part.slice(1), 16));
+    else for (const byte of encoder.encode(part)) out.push(byte);
+  }
+  return new Uint8Array(out);
+}
+
+/** filename*: «кодировка'язык'значение-в-процентах» (RFC 5987). */
+function decodeExtValue(value: string): string | undefined {
+  const match = value.trim().match(/^([A-Za-z0-9!#$&+^_`{}~-]*)'[^']*'(.*)$/);
+  if (!match) return undefined;
+  const charset = (match[1] ?? "").toLowerCase();
+  const bytes = percentBytes(match[2] ?? "");
+  try {
+    if (charset === "utf-8" || charset === "utf8" || charset === "") {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    }
+    if (charset === "iso-8859-1" || charset === "latin1") return String.fromCharCode(...bytes);
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Заголовки HTTP — это байты: имя, отправленное сервером «как есть» в UTF-8, может прийти
+ * прочитанным как latin1 («Ð¾Ñ…»). Если строка целиком из таких байтов и складывается
+ * в правильный UTF-8 — это он.
+ */
+function repairUtf8(value: string): string {
+  if (!/[\u0080-\u00ff]/.test(value) || /[^\u0000-\u00ff]/.test(value)) return value;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(value, (c) => c.charCodeAt(0)));
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Имя файла из Content-Disposition (RFC 6266): filename* (RFC 5987, с явной кодировкой) главнее
+ * filename — простой filename сервер обычно даёт запасным вариантом для старых клиентов.
+ */
+function filenameFromDisposition(header: string | null | undefined): string | undefined {
+  if (!header) return undefined;
+  const params = new Map<string, string>();
+  for (const m of header.matchAll(/;\s*([^\s=;]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]*))/g)) {
+    const key = (m[1] ?? "").toLowerCase();
+    const value = m[2] !== undefined ? m[2].replace(/\\(.)/g, "$1") : (m[3] ?? "").trim();
+    if (key && !params.has(key)) params.set(key, value);
+  }
+  const extended = params.get("filename*");
+  const decoded = extended === undefined ? undefined : decodeExtValue(extended);
+  if (decoded?.trim()) return decoded;
+  const plain = params.get("filename");
+  return plain?.trim() ? repairUtf8(plain) : undefined;
+}
+
+/** Последний сегмент пути ссылки — имя, если сервер его не назвал. */
+function fileNameFromUrl(url: URL): string {
+  const last = url.pathname.split("/").filter(Boolean).pop() ?? "";
+  try {
+    return decodeURIComponent(last);
+  } catch {
+    return last;
+  }
+}
+
+/** Имя без каталогов и управляющих символов, не длиннее того, что хранит Outline (255). */
+function cleanFileName(raw: string | undefined): string {
+  let name = ((raw ?? "").split(/[\\/]/).filter(Boolean).pop() ?? "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (name === "." || name === "..") name = "";
+  if (name.length > 255) {
+    const dot = name.lastIndexOf(".");
+    const ext = dot > 0 && name.length - dot <= 16 ? name.slice(dot) : "";
+    name = name.slice(0, 255 - ext.length) + ext;
+  }
+  return name || "file";
+}
+
+function mediaType(value: string | null | undefined): string {
+  const type = (value ?? "").split(";")[0]!.trim().toLowerCase();
+  return /^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/.test(type) ? type : "";
+}
+
+/**
+ * Тип файла: заявленный сервером главнее. «application/octet-stream» ничего не говорит —
+ * тогда, как браузер, по расширению имени (таблица типов в Bun; файл при этом не читается).
+ */
+function contentTypeFor(declared: string | null | undefined, name: string): string {
+  const type = mediaType(declared);
+  if (type && type !== "application/octet-stream" && type !== "binary/octet-stream") return type;
+  return mediaType(Bun.file(name).type) || "application/octet-stream";
+}
+
+function isInlineImage(contentType: string): boolean {
+  return INLINE_IMAGE_RE.test(contentType);
+}
+
+function formatBytes(bytes: number): string {
+  const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  const shown =
+    unit === 0 || value >= 100 ? String(Math.round(value)) : value.toFixed(1).replace(".", ",").replace(/,0$/, "");
+  return `${shown} ${units[unit]}`;
+}
+
+/**
+ * Подпись вложения в разметке. Outline 1.10.1 (shared/editor/rules/links.ts) превращает в вложение
+ * ссылку на /api/attachments.redirect и берёт подпись только из ПЕРВОГО текстового фрагмента ссылки,
+ * отделяя размер по последнему пробелу. Экранирование обратной косой не спасает — оно само дробит
+ * текст на фрагменты, — поэтому знаки, с которых начинается разметка, заменяются. Обычные имена
+ * («IMG_2041.jpg», «Отчёт (финал).xlsx») не меняются.
+ */
+function attachmentTitle(name: string): string {
+  const title = name
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\[/g, "(")
+    .replace(/\]/g, ")")
+    .replace(/[\\`*$]/g, "-")
+    .replace(/~{2,}|={2,}/g, (run) => "-".repeat(run.length))
+    .replace(/&(?=#?[0-9A-Za-z]+;)/g, "+")
+    // «_» внутри слова разметку не начинает, а на границе слова открывает курсив: «_черновик_».
+    .replace(/_+/g, (run: string, offset: number, whole: string) =>
+      /[\p{L}\p{N}]/u.test(whole[offset - 1] ?? "") && /[\p{L}\p{N}]/u.test(whole[offset + run.length] ?? "")
+        ? run
+        : "-".repeat(run.length),
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+  return title || "file";
+}
+
+type AppendixItem = { name: string; size: number; contentType: string; url: string };
+
+/**
+ * Текст, дописываемый в конец документа: строка комментария и по абзацу на файл.
+ *
+ * Ведущая пустая строка обязательна: в режиме append Outline сливает первый абзац дописываемого
+ * текста с последним абзацем документа, если текст не начинается с перевода строки
+ * (DocumentHelper.applyMarkdownToDocument) — комментарий приклеился бы к чужой фразе.
+ * Каждое вложение — отдельным абзацем: правило Outline заменяет вложением весь абзац со ссылкой
+ * и выбрасывает остальное, что в нём было, — комментарий в том же абзаце пропал бы.
+ * Формат вложения — как у самого Outline: «[имя размер-в-байтах](/api/attachments.redirect?id=…)».
+ */
+function appendixMarkdown(comment: string | undefined, items: AppendixItem[]): string {
+  const blocks: string[] = [];
+  if (comment?.trim()) blocks.push(comment.trim());
+  for (const item of items) {
+    const title = attachmentTitle(item.name);
+    blocks.push(isInlineImage(item.contentType) ? `![${title}](${item.url})` : `[${title} ${item.size}](${item.url})`);
+  }
+  return `\n\n${blocks.join("\n\n")}\n`;
+}
+
+/** Почему не вышло, без текста исключения: в нём бывает адрес со строкой запроса. */
+function networkReason(error: unknown): string {
+  const name = error instanceof Error ? error.name : "";
+  const code = isRecord(error) && typeof error.code === "string" ? error.code : "";
+  if (name === "TimeoutError" || name === "AbortError") return "сервер не ответил вовремя";
+  if (/CERT|SSL|TLS|SELF_SIGNED|VERIFY/i.test(code)) return `сертификат сервера не прошёл проверку (${code})`;
+  if (/REFUSED/i.test(code)) return "соединение отклонено";
+  if (/ENOTFOUND|EAI_AGAIN|DNS/i.test(code)) return "адрес сервера не найден";
+  if (/RESET|ECONNABORTED|EPIPE|SOCKET|CLOSED/i.test(code)) return "соединение оборвалось";
+  return `сетевая ошибка${code ? ` (${code})` : name ? ` (${name})` : ""}`;
+}
+
+/** Перенаправления — вручную: каждое обязано остаться на https. */
+async function fetchFollowingHttps(start: URL, signal: AbortSignal): Promise<{ res: Response; url: URL }> {
+  let url = start;
+  for (let hop = 0; ; hop++) {
+    const res = await fetch(url, { redirect: "manual", signal, headers: { Accept: "*/*" } });
+    if (res.status < 300 || res.status >= 400 || res.status === 304) return { res, url };
+    const location = res.headers.get("location");
+    await res.body?.cancel().catch(() => undefined);
+    if (!location) throw new UserError(`Ссылка на ${safeUrl(start)}: перенаправление без адреса (${res.status}).`);
+    if (hop >= MAX_REDIRECTS) throw new UserError(`Ссылка на ${safeUrl(start)}: слишком много перенаправлений.`);
+    const next = new URL(location, url);
+    rememberSecret(next);
+    if (next.protocol !== "https:") {
+      throw new UserError(`Ссылка на ${safeUrl(start)} перенаправляет на не-https адрес ${safeUrl(next)} — скачивание остановлено.`);
+    }
+    url = next;
+  }
+}
+
+/** Скачать по одноразовой ссылке с пределом размера и тайм-аутом. */
+async function downloadFile(
+  raw: string,
+  maxBytes: number,
+): Promise<{ bytes: Uint8Array; name: string; contentType: string; origin: string }> {
+  const start = parseDownloadUrl(raw);
+  const origin = safeUrl(start);
+  const tooBig = (): UserError =>
+    new UserError(
+      `Файл по ссылке ${origin} больше ${formatBytes(maxBytes)} — скачивание остановлено. ` +
+        `Предел меняется флагом --max-mb, но и Outline принимает файлы не любого размера.`,
+    );
+
+  let res: Response;
+  let finalUrl: URL;
+  try {
+    ({ res, url: finalUrl } = await fetchFollowingHttps(start, AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS)));
+  } catch (error) {
+    if (error instanceof UserError) throw error;
+    throw new UserError(`Не удалось скачать ${origin}: ${networkReason(error)}.`);
+  }
+
+  if (res.status === 404 || res.status === 410) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new UserError(`Ссылка на ${origin} истекла или уже использована — попросите новую.`);
+  }
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => undefined);
+    const hint = res.status === 401 || res.status === 403 ? ": доступ по ссылке закрыт — попросите новую" : "";
+    throw new UserError(`Не удалось скачать ${origin}: сервер ответил ${res.status}${hint}.`);
+  }
+  const declared = Number(res.headers.get("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await res.body?.cancel().catch(() => undefined);
+    throw tooBig();
+  }
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = res.body?.getReader();
+  if (reader) {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => undefined);
+          throw tooBig();
+        }
+        chunks.push(value);
+      }
+    } catch (error) {
+      if (error instanceof UserError) throw error;
+      throw new UserError(`Не удалось дочитать файл по ссылке ${origin}: ${networkReason(error)}.`);
+    }
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  const name = cleanFileName(filenameFromDisposition(res.headers.get("content-disposition")) ?? fileNameFromUrl(finalUrl));
+  return { bytes, name, contentType: contentTypeFor(res.headers.get("content-type"), name), origin };
+}
+
+type DownloadMeta = { name: string; contentType: string; size: number; origin: string; savedAt: number };
+
+/** Ключ копии — хеш ссылки целиком: сама ссылка (и токен в ней) на диск не пишется. */
+function downloadKey(raw: string): string {
+  return new Bun.CryptoHasher("sha256").update(raw.trim()).digest("hex");
+}
+
+function isDownloadMeta(value: unknown): value is DownloadMeta {
+  return (
+    isRecord(value) &&
+    typeof value.name === "string" &&
+    typeof value.contentType === "string" &&
+    typeof value.size === "number" &&
+    typeof value.origin === "string" &&
+    typeof value.savedAt === "number"
+  );
+}
+
+async function prepareRemoteFile(raw: string, maxBytes: number): Promise<PreparedFile> {
+  parseDownloadUrl(raw); // проверка схемы и токен — в список скрываемых, даже если копия уже есть
+  const key = downloadKey(raw);
+  const binPath = join(DOWNLOAD_DIR, `${key}.bin`);
+  const metaPath = join(DOWNLOAD_DIR, `${key}.json`);
+  const fromMeta = (meta: DownloadMeta, cached: boolean): PreparedFile => ({
+    kind: "url",
+    name: meta.name,
+    size: meta.size,
+    contentType: meta.contentType,
+    path: binPath,
+    origin: meta.origin,
+    cached,
+    cacheKey: key,
+  });
+
+  const meta: unknown = await Bun.file(metaPath)
+    .json()
+    .catch(() => null);
+  if (isDownloadMeta(meta) && Date.now() - meta.savedAt <= DOWNLOAD_TTL_MS) {
+    const copy = await stat(binPath).catch(() => null);
+    if (copy?.isFile() && copy.size === meta.size) return fromMeta(meta, true);
+  }
+
+  const got = await downloadFile(raw, maxBytes);
+  await mkdir(DOWNLOAD_DIR, { recursive: true, mode: 0o700 });
+  const temporary = `${binPath}.${process.pid}.tmp`;
+  await writeFile(temporary, got.bytes, { mode: 0o600 });
+  await rename(temporary, binPath);
+  const fresh: DownloadMeta = {
+    name: got.name,
+    contentType: got.contentType,
+    size: got.bytes.byteLength,
+    origin: got.origin,
+    savedAt: Date.now(),
+  };
+  await writeFile(metaPath, JSON.stringify(fresh), { mode: 0o600 });
+  return fromMeta(fresh, false);
+}
+
+async function prepareLocalFile(path: string): Promise<PreparedFile> {
+  const info = await stat(path).catch(() => null);
+  if (!info) throw new UserError(`Файл не найден: ${path}`);
+  if (!info.isFile()) throw new UserError(`Это не файл: ${path}`);
+  const name = cleanFileName(basename(path));
+  return { kind: "file", name, size: info.size, contentType: contentTypeFor(null, name), path, origin: path };
+}
+
+/** Удалить локальные копии скачанного — после записи они не нужны. */
+async function dropDownloads(files: PreparedFile[]): Promise<void> {
+  for (const file of files) {
+    if (!file.cacheKey) continue;
+    await removePath(join(DOWNLOAD_DIR, `${file.cacheKey}.bin`), { force: true }).catch(() => undefined);
+    await removePath(join(DOWNLOAD_DIR, `${file.cacheKey}.json`), { force: true }).catch(() => undefined);
+  }
+}
+
+/** Неподтверждённые копии старше часа удаляются при любом запуске скрипта. */
+async function purgeStaleDownloads(): Promise<void> {
+  let names: string[];
+  try {
+    names = await readdir(DOWNLOAD_DIR);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const full = join(DOWNLOAD_DIR, name);
+    const info = await stat(full).catch(() => null);
+    if (info && Date.now() - info.mtimeMs > DOWNLOAD_TTL_MS) {
+      await removePath(full, { force: true }).catch(() => undefined);
+    }
+  }
+}
+
+function attachSources(args: Args): AttachSource[] {
+  const sources: AttachSource[] = [];
+  for (const [name, value] of args.all) {
+    if (name !== "file" && name !== "url") continue;
+    if (value === true || !value.trim()) throw new UserError(`Флаг --${name} без значения.`);
+    if (name === "url") parseDownloadUrl(value);
+    sources.push({ kind: name, value });
+  }
+  if (sources.length === 0) {
+    throw new UserError("Нечего прикладывать: укажите --file <путь> и/или --url <https-ссылка> (флаги повторяемы).");
+  }
+  if (sources.length > MAX_FILES) {
+    throw new UserError(`За один раз — не больше ${MAX_FILES} файлов: Outline ограничивает частоту загрузок.`);
+  }
+  return sources;
+}
+
+/** Где документ и кто его увидит: коллекция из clientCollections поднимает планку проверки. */
+async function documentCollection(
+  rm: Resolved,
+  collectionId: string | null,
+): Promise<{ id: string; name: string; client: boolean; resolved: boolean } | null> {
+  if (!collectionId) return null;
+  let collection: Collection | undefined = (await collections(rm)).find((c) => c.id === collectionId);
+  if (!collection) {
+    collection = await api<Collection>(rm, "collections.info", { id: collectionId }).catch(() => undefined);
+  }
+  if (!collection) {
+    // Название узнать не удалось: если клиентские коллекции заданы, считаем документ клиентским.
+    const marks = rm.clientCollections ?? [];
+    return { id: collectionId, name: collectionId, client: marks.length > 0, resolved: false };
+  }
+  return { id: collection.id, name: collection.name, client: isClientCollection(rm, collection), resolved: true };
+}
+
+type Exposure = { state: "none" | "public" | "unknown"; detail: string };
+
+/**
+ * Опубликованные ссылки из ответа shares.info: 1.10.1 отдаёт { shares: [...] } или 204, если ссылки
+ * нет, старые версии — одну ссылку или 404.
+ */
+async function publishedShares(rm: Resolved, body: Record<string, unknown>): Promise<Record<string, unknown>[]> {
+  let data: unknown;
+  try {
+    data = await api<unknown>(rm, "shares.info", body);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return [];
+    throw error;
+  }
+  const list: unknown[] =
+    isRecord(data) && Array.isArray(data.shares) ? data.shares : isRecord(data) && typeof data.id === "string" ? [data] : [];
+  return list.filter((s): s is Record<string, unknown> => isRecord(s) && s.published === true);
+}
+
+/**
+ * Открыт ли документ публичной ссылкой. Outline 1.10.1 на shares.info { documentId } отвечает 204,
+ * если своей ссылки у документа нет, — даже когда открыта вся коллекция или родительский документ
+ * вместе с вложенными. Поэтому по очереди проверяются своя ссылка, ссылка на коллекцию и ссылки
+ * родительских документов вверх по дереву. Не удалось проверить — «неизвестно», и планка строгая.
+ */
+async function publicExposure(rm: Resolved, doc: Doc): Promise<Exposure> {
+  const found = (share: Record<string, unknown>): Exposure => {
+    const how =
+      share.documentId === doc.id
+        ? "своя ссылка"
+        : typeof share.collectionId === "string" && share.collectionId
+          ? "ссылка на всю коллекцию"
+          : "ссылка на родительский документ вместе с вложенными";
+    return { state: "public", detail: `есть — ${how}` };
+  };
+  try {
+    const own = await publishedShares(rm, { documentId: doc.id });
+    const first = own.find((s) => s.documentId === doc.id) ?? own[0];
+    if (first) return found(first);
+    if (doc.collectionId) {
+      const whole = await publishedShares(rm, { collectionId: doc.collectionId });
+      if (whole[0]) return found(whole[0]);
+    }
+    // Ссылка родителя открывает потомков, только если выдана вместе с вложенными документами.
+    const seen = new Set<string>([doc.id]);
+    let parentId = doc.parentDocumentId ?? null;
+    while (parentId && !seen.has(parentId) && seen.size <= 25) {
+      seen.add(parentId);
+      const covering = (await publishedShares(rm, { documentId: parentId })).find(
+        (s) => s.includeChildDocuments === true || (typeof s.collectionId === "string" && s.collectionId !== ""),
+      );
+      if (covering) return found(covering);
+      parentId = (await loadDoc(rm, parentId)).parentDocumentId ?? null;
+    }
+    return { state: "none", detail: "нет" };
+  } catch (error) {
+    const reason = error instanceof ApiError ? `${error.status} ${error.code}` : networkReason(error);
+    return { state: "unknown", detail: `проверить не удалось (${reason})` };
+  }
+}
+
+/** Предел из текста отказа Outline: «… the maximum size is 976.56 KB». */
+function outlineLimit(message: string): string | undefined {
+  const match = message.match(/maximum size(?: is| of)?\s+([\d.,]+)\s*(Bytes|KB|MB|GB|TB)/i);
+  if (!match) return undefined;
+  const units: Record<string, string> = { bytes: "Б", kb: "КБ", mb: "МБ", gb: "ГБ", tb: "ТБ" };
+  return `${(match[1] ?? "").replace(".", ",")} ${units[(match[2] ?? "").toLowerCase()] ?? match[2]}`;
+}
+
+/** Отказ Outline на attachments.create — словами: что случилось и что с этим делать. */
+function attachRefusal(error: ApiError, file: PreparedFile, doc: Doc): string {
+  const raw = error.serverMessage;
+  if (error.status === 403 || error.code === "authorization_error") {
+    if (/api key|access token/i.test(raw)) {
+      return (
+        "ключ API ограничен по областям доступа и не допускает загрузку вложений — " +
+        "выпустите ключ без ограничений (Outline → Настройки → API)"
+      );
+    }
+    return (
+      `у вас нет права править документ «${doc.title}», а без него Outline не даёт прикладывать файлы. ` +
+      `Попросите право на правку у владельца документа или коллекции`
+    );
+  }
+  if (/too large|maximum size|larger than/i.test(raw)) {
+    const limit = outlineLimit(raw);
+    return `файл (${formatBytes(file.size)}) больше, чем принимает Outline${limit ? `: предел ${limit}` : ""}`;
+  }
+  if (error.status === 429) return "Outline ограничивает частоту загрузок — подождите минуту и повторите";
+  if (error.status === 401) return "токен неверен или отозван — перевыпустите его в Outline: Настройки → API";
+  if (error.status === 404) return "документ не найден: удалён или недоступен вашей учётной записи";
+  return `Outline отказал (${error.status} ${error.code}${raw ? `: ${raw}` : ""})`;
+}
+
+type UploadPlan =
+  | { mode: "post"; target: URL; internal: boolean; form: Record<string, string> }
+  | { mode: "put"; target: URL; internal: boolean; headers: Record<string, string> };
+
+/**
+ * Куда и как грузить байты. Относительный адрес — это сам Outline (локальное хранилище,
+ * /api/files.create): запрос идёт к адресу инстанса и с ключом. Внешнее хранилище (S3 и
+ * совместимые) получает файл по подписанной форме: ключ Outline ему не нужен и не должен
+ * уходить третьей стороне, поэтому заголовка Authorization там нет.
+ */
+function uploadTarget(rm: Resolved, value: string): { target: URL; internal: boolean } {
+  if (value.startsWith("/") && !value.startsWith("//")) {
+    return { target: new URL(value.replace(/^\/+/, ""), rm.base), internal: true };
+  }
+  const target = new URL(value, rm.base);
+  if (rm.base.startsWith("https:") && target.protocol !== "https:") {
+    throw new UserError(
+      `Outline предлагает загрузить файл в хранилище ${target.host} без шифрования (${target.protocol.replace(":", "")}) — загрузка остановлена.`,
+    );
+  }
+  return { target, internal: false };
+}
+
+/**
+ * Ответ attachments.create в 1.10.1: { mode: "post", uploadUrl, form, attachment } — форма для
+ * multipart, либо { mode: "put", url, headers, attachment } — подписанный PUT (AWS_S3_UPLOAD_METHOD=put).
+ * В локальном хранилище предел размера лежит в form.maxUploadSize.
+ */
+function uploadPlan(rm: Resolved, data: Record<string, unknown>, file: PreparedFile): UploadPlan {
+  if (data.mode === "put") {
+    if (typeof data.url !== "string" || !data.url) throw new UserError("Outline не выдал адрес загрузки (PUT).");
+    const headers: Record<string, string> = {};
+    if (isRecord(data.headers)) {
+      for (const [key, value] of Object.entries(data.headers)) {
+        if (typeof value === "string" || typeof value === "number") headers[key] = String(value);
+      }
+    }
+    return { mode: "put", ...uploadTarget(rm, data.url), headers };
+  }
+  if (typeof data.uploadUrl !== "string" || !data.uploadUrl) throw new UserError("Outline не выдал адрес загрузки.");
+  const form: Record<string, string> = {};
+  if (isRecord(data.form)) {
+    for (const [key, value] of Object.entries(data.form)) {
+      if (value !== undefined && value !== null) form[key] = String(value);
+    }
+  }
+  const limit = Number(form.maxUploadSize ?? data.maxUploadSize);
+  if (Number.isFinite(limit) && limit > 0 && file.size > limit) {
+    throw new UserError(`«${file.name}» (${formatBytes(file.size)}) больше предела Outline: ${formatBytes(limit)}.`);
+  }
+  return { mode: "post", ...uploadTarget(rm, data.uploadUrl), form };
+}
+
+/** Отказ хранилища — словами. Из ответа берутся только код и сообщение, а не весь текст. */
+function uploadRefusal(status: number, body: string, plan: UploadPlan, file: PreparedFile): string {
+  const where = plan.internal ? "Outline" : `хранилище файлов (${plan.target.host})`;
+  const ending = plan.internal ? "" : "о"; // «Outline ответил», «хранилище ответило»
+  let code = body.match(/<Code>([^<]{1,80})<\/Code>/)?.[1];
+  let message = body.match(/<Message>([^<]{1,200})<\/Message>/)?.[1];
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (isRecord(parsed)) {
+      if (typeof parsed.error === "string") code ??= parsed.error;
+      if (typeof parsed.message === "string") message ??= parsed.message.slice(0, 200);
+    }
+  } catch {
+    /* не JSON */
+  }
+  if (status === 413 || code === "EntityTooLarge" || /too large|exceeds|larger than/i.test(message ?? "")) {
+    return `${where} не принимает файл такого размера (${formatBytes(file.size)})`;
+  }
+  if (status === 401) return `${where} не принял${ending} авторизацию при загрузке (401)`;
+  if (status === 403 && plan.internal && /api key|access token/i.test(message ?? "")) {
+    return "ключ API ограничен по областям доступа и не допускает загрузку файлов — выпустите ключ без ограничений (Outline → Настройки → API)";
+  }
+  if (status === 403 && !plan.internal) {
+    return `${where} отклонило загрузку (403${code ? ` ${code}` : ""}): подпись формы не подошла или истекла — повторите команду`;
+  }
+  return `${where} ответил${ending} ${status}${code ? ` ${code}` : ""}${message ? `: ${message}` : ""}`;
+}
+
+/** Имя в части multipart: кавычки и переводы строк сломали бы заголовок части. */
+function multipartName(name: string): string {
+  return name.replace(/["\\\r\n]/g, "_");
+}
+
+async function uploadBytes(rm: Resolved, plan: UploadPlan, file: PreparedFile): Promise<void> {
+  const bytes = new Uint8Array(await Bun.file(file.path).arrayBuffer());
+  if (bytes.byteLength !== file.size) {
+    throw new UserError(
+      `«${file.name}» изменился после предпросмотра (${file.size} → ${bytes.byteLength} байт) — повторите команду.`,
+    );
+  }
+  const auth: Record<string, string> = plan.internal
+    ? { Authorization: `Bearer ${rm.apiKey}`, Accept: "application/json" }
+    : {};
+
+  const postForm = async (form: Record<string, string>, headers: Record<string, string>): Promise<Response> => {
+    const body = new FormData();
+    for (const [key, value] of Object.entries(form)) body.append(key, value);
+    // Файл — последним полем: S3 не читает поля формы, пришедшие после файла.
+    body.append("file", new Blob([bytes], { type: file.contentType }), multipartName(file.name));
+    return fetch(plan.target, { method: "POST", headers, body, signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS) });
+  };
+
+  let res: Response;
+  try {
+    if (plan.mode === "put") {
+      // Content-Length подписан в адресе и совпадает с длиной тела — fetch выставит его сам.
+      const headers = Object.fromEntries(
+        Object.entries(plan.headers).filter(([key]) => key.toLowerCase() !== "content-length"),
+      );
+      res = await fetch(plan.target, {
+        method: "PUT",
+        headers: { ...headers, ...auth },
+        body: bytes,
+        signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+      });
+    } else {
+      res = await postForm(plan.form, auth);
+      // Outline 1.10 подписывает форму загрузки (поле sig), и подпись сама разрешает загрузку.
+      // Ключ, ограниченный по областям доступа без files.*, получает здесь 403, хотя подписи
+      // хватило бы, — тогда повтор той же формы без ключа.
+      if (res.status === 403 && plan.internal && plan.form.sig) {
+        await res.body?.cancel().catch(() => undefined);
+        res = await postForm(plan.form, { Accept: "application/json" });
+      }
+    }
+  } catch (error) {
+    const where = plan.internal ? "Outline" : `хранилище ${plan.target.host}`;
+    throw new UserError(`«${file.name}»: не удалось передать файл в ${where}: ${networkReason(error)}.`);
+  }
+
+  const body = await res.text().catch(() => "");
+  let refused = !res.ok;
+  if (!refused && plan.internal) {
+    try {
+      const parsed: unknown = JSON.parse(body);
+      refused = isRecord(parsed) && parsed.ok === false;
+    } catch {
+      /* пустой ответ или не JSON — успех определяется кодом */
+    }
+  }
+  if (refused) throw new UserError(`«${file.name}»: ${uploadRefusal(res.status, body, plan, file)}.`);
+}
+
+/**
+ * Дописать текст в конец документа, не потеряв чужую правку.
+ *
+ * Выбран режим append, а не чтение и запись текста целиком: при чтении-записи всё, что коллеги
+ * успели изменить между нашим чтением и записью (а загрузка файлов занимает секунды), стёрлось бы
+ * нашей копией текста. В режиме append сервер сам дописывает текст к своей текущей версии документа,
+ * включая состояние совместного редактирования, — открытые редакторы получают правку сразу.
+ *
+ * Остаётся узкое окно внутри Outline: documentUpdater читает документ до блокировки строки.
+ * Его закрывает lastRevision: если документ изменился после нашего чтения, сервер отвечает 409
+ * и ничего не пишет — тогда перечитываем номер правки и повторяем.
+ *
+ * append: true дублирует editMode для версий без editMode: без него такая версия отбросила бы
+ * незнакомое поле и молча заменила весь текст документа нашими ссылками.
+ */
+async function appendToDocument(rm: Resolved, doc: Doc, text: string): Promise<void> {
+  let revision = doc.revision;
+  for (let attempt = 1; attempt <= UPDATE_ATTEMPTS; attempt++) {
+    try {
+      await api<Doc>(rm, "documents.update", {
+        id: doc.id,
+        text,
+        append: true,
+        editMode: "append",
+        ...(typeof revision === "number" ? { lastRevision: revision } : {}),
+      });
+      return;
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 409) throw error;
+      revision = (await loadDoc(rm, doc.id)).revision;
+    }
+  }
+  throw new UserError(
+    `документ меняется прямо сейчас: ${UPDATE_ATTEMPTS} попыток дописать подряд пришлись на чужие правки. Повторите через минуту`,
+  );
+}
+
+/** Откат незавершённой записи: вложения, на которые документ не ссылается, удаляются. */
+async function rollbackAttachments(rm: Resolved, ids: string[]): Promise<string> {
+  if (ids.length === 0) return "Документ не изменён, в Outline ничего не загружено.";
+  const left: string[] = [];
+  for (const id of ids) {
+    try {
+      await api(rm, "attachments.delete", { id });
+    } catch {
+      left.push(id);
+    }
+  }
+  return left.length === 0
+    ? `Документ не изменён; уже загруженные вложения (${ids.length}) удалены.`
+    : `Документ не изменён. Удалить не удалось вложения: ${left.join(", ")} — на них ничто не ссылается.`;
+}
+
+function describeFailure(error: unknown): string {
+  if (error instanceof UserError || error instanceof ApiError) return error.message;
+  return `сбой: ${networkReason(error)}`;
 }
 
 // ───────────────────────────── команды ────────────────────────────────
@@ -908,6 +1703,223 @@ async function cmdExport(rm: Resolved, args: Args): Promise<void> {
   );
 }
 
+/**
+ * Приложить файлы к документу от имени и с правами самого человека — его ключом из конфига.
+ * Байты загружаются в Outline (attachments.create + загрузка в хранилище), в конец документа
+ * дописываются строка комментария и ссылки на файлы; остальной текст не трогается.
+ */
+async function cmdAttach(rm: Resolved, args: Args): Promise<void> {
+  const value = args.positional[0] ?? str(args, "id");
+  if (!value) {
+    throw new UserError(
+      'Укажите документ: outline.ts attach <id|url> (--file <путь> | --url <https-ссылка>)… [--comment "…"]',
+    );
+  }
+  const sources = attachSources(args);
+  const commentFlag = args.flags.get("comment");
+  if (commentFlag === true) throw new UserError('--comment без текста: --comment "…"');
+  const comment = commentFlag?.trim() || undefined;
+  // Одноразовая ссылка в тексте документа раздала бы её токен всем читателям. Сверяются длинные
+  // строки — ссылка, строка запроса, токен, — чтобы короткое значение вроде lang=ru не мешало.
+  if (comment && [...SECRET_STRINGS].some((secret) => secret.length >= 12 && comment.includes(secret))) {
+    throw new UserError(
+      "В комментарии — ссылка из --url: она одноразовая и с токеном, в документ её вставлять нельзя. " +
+        "Уберите её из комментария: файл и так будет приложен.",
+    );
+  }
+  const maxMb = num(args, "max-mb") ?? DEFAULT_MAX_MB;
+  if (maxMb <= 0) throw new UserError("--max-mb ожидает число мегабайт больше нуля.");
+
+  const doc = await loadDoc(rm, value);
+  if (doc.deletedAt) throw new UserError(`Документ «${doc.title}» в корзине — сначала восстановите его.`);
+
+  // Кто увидит вложения: клиентская коллекция и публичная ссылка поднимают планку проверки.
+  // Не удалось проверить ссылку — считаем, что она есть: ошибиться в строгую сторону дешевле.
+  const collection = await documentCollection(rm, doc.collectionId);
+  const exposure = await publicExposure(rm, doc);
+  const audience: Audience = collection?.client || exposure.state !== "none" ? "client" : "internal";
+
+  // Ссылки скачиваются уже при предпросмотре: они одноразовые, а без имени и размера не показать
+  // текст, который уйдёт в документ, и не проверить его.
+  const maxBytes = Math.floor(maxMb * 1024 * 1024);
+  const files: PreparedFile[] = [];
+  for (const source of sources) {
+    files.push(
+      source.kind === "file" ? await prepareLocalFile(source.value) : await prepareRemoteFile(source.value, maxBytes),
+    );
+  }
+
+  // Проверяется всё, что станет текстом документа: комментарий и имена файлов.
+  const fields: Record<string, string | undefined> = { комментарий: comment };
+  files.forEach((file, index) => {
+    fields[`имя файла ${index + 1}`] = file.name;
+  });
+  checkOutgoing(fields, args, audience);
+
+  const warnings: string[] = [];
+  if (collection?.client) {
+    warnings.push(
+      collection.resolved
+        ? `документ в клиентской коллекции «${collection.name}»: файлы увидят клиенты`
+        : "коллекцию документа определить не удалось — проверка по клиентской планке",
+    );
+  }
+  if (exposure.state === "public") {
+    warnings.push("документ открыт публичной ссылкой: файлы будут доступны любому, у кого она есть, без входа в Outline");
+  }
+  if (exposure.state === "unknown") {
+    warnings.push(`открыт ли документ публичной ссылкой, ${exposure.detail} — проверка по клиентской планке`);
+  }
+  if (audience === "client") {
+    warnings.push(
+      "комментарий и имена файлов проверены по клиентской планке; содержимое файлов скилл не проверяет — " +
+        "убедитесь, что его можно показывать",
+    );
+  }
+  if (doc.archivedAt) warnings.push("документ в архиве");
+
+  const total = files.reduce((sum, file) => sum + file.size, 0);
+  const preview =
+    `ВЛОЖЕНИЯ В ДОКУМЕНТ · инстанс ${rm.name}\n${docUrl(rm, doc)}\n` +
+    table([
+      ["Документ", doc.title || "(без названия)"],
+      ["Коллекция", collection ? `${collection.name}${collection.client ? " (клиентская)" : ""}` : "— (вне коллекции)"],
+      ["Состояние", `${doc.publishedAt ? "опубликован" : "черновик"}${doc.archivedAt ? ", в архиве" : ""}`],
+      ["Публичная ссылка", exposure.detail],
+      ["Планка проверки", audience === "client" ? "клиентская" : "внутренняя"],
+      ["Файлов", `${files.length}, всего ${formatBytes(total)}`],
+      ["Кто пишет", "вы, своим ключом: право на правку Outline проверит сам"],
+    ]) +
+    (warnings.length ? `\n\nВнимание:\n${warnings.map((w) => `  — ${w}`).join("\n")}` : "") +
+    `\n\nФАЙЛЫ:\n` +
+    table(
+      files.map((file, index) => [
+        `${index + 1}.`,
+        file.name,
+        formatBytes(file.size),
+        file.contentType,
+        isInlineImage(file.contentType) ? "картинкой" : "вложением",
+        file.kind === "file"
+          ? `с диска: ${file.origin}`
+          : `по ссылке: ${file.origin} (${file.cached ? "скачан ранее" : "скачан"}, ждёт подтверждения)`,
+      ]),
+    ) +
+    `\n\nДОПИСЫВАЕТСЯ В КОНЕЦ ДОКУМЕНТА:\n${RULE}\n` +
+    appendixMarkdown(
+      comment,
+      files.map((file) => ({ ...file, url: "/api/attachments.redirect?id=…" })),
+    ).trim() +
+    `\n${RULE}\nОстальной текст документа не меняется. Адреса вложений Outline выдаст при записи.` +
+    (files.some((file) => file.kind === "url")
+      ? "\nСкачанное лежит локально до записи (не дольше часа): второй раз по ссылке скилл не пойдёт."
+      : "");
+  if (!requireConfirmation(args, preview)) return;
+
+  // ── запись: вложения → текст документа → сверка ──
+  const created: string[] = [];
+  const attached: { file: PreparedFile; id: string; url: string }[] = [];
+  try {
+    for (const file of files) {
+      let data: unknown;
+      try {
+        data = await api<unknown>(rm, "attachments.create", {
+          name: file.name,
+          documentId: doc.id,
+          contentType: file.contentType,
+          size: file.size,
+          preset: "documentAttachment",
+        });
+      } catch (error) {
+        if (error instanceof ApiError) throw new UserError(`«${file.name}»: ${attachRefusal(error, file, doc)}.`);
+        throw error;
+      }
+      const attachment = isRecord(data) && isRecord(data.attachment) ? data.attachment : null;
+      const id = typeof attachment?.id === "string" && UUID_RE.test(attachment.id) ? attachment.id : null;
+      if (!isRecord(data) || !id) {
+        throw new UserError(`«${file.name}»: Outline ответил на attachments.create без идентификатора вложения.`);
+      }
+      created.push(id);
+      await uploadBytes(rm, uploadPlan(rm, data, file), file);
+      // Ссылка — через attachments.redirect, как у самого Outline: по ней правило разметки узнаёт вложение.
+      attached.push({ file, id, url: `/api/attachments.redirect?id=${id}` });
+    }
+  } catch (error) {
+    const cleanup = await rollbackAttachments(rm, created);
+    throw new UserError(`Файлы не приложены: ${describeFailure(error)}\n${cleanup}`);
+  }
+
+  const appendix = appendixMarkdown(
+    comment,
+    attached.map((item) => ({ ...item.file, url: item.url })),
+  );
+  try {
+    await appendToDocument(rm, doc, appendix);
+  } catch (error) {
+    // Ответ мог потеряться уже после записи: удалять вложения можно, только убедившись,
+    // что документ на них не ссылается.
+    const now = await loadDoc(rm, doc.id).catch(() => null);
+    if (!now || !attached.every((item) => now.text.includes(item.id))) {
+      const cleanup = now
+        ? await rollbackAttachments(rm, created)
+        : `Документ перечитать не удалось, поэтому вложения не удалялись: ${created.join(", ")}.`;
+      throw new UserError(`Ссылки в документ не дописаны: ${describeFailure(error)}\n${cleanup}`);
+    }
+  }
+
+  // Запись прошла: локальные копии скачанного больше не нужны, а повтор команды загрузил бы файлы
+  // второй раз — поэтому они удаляются до сверки, что бы она ни показала.
+  await dropDownloads(files);
+
+  const result = {
+    document: { id: doc.id, title: doc.title, url: docUrl(rm, doc) },
+    attachments: attached.map((item) => ({
+      id: item.id,
+      name: item.file.name,
+      size: item.file.size,
+      contentType: item.file.contentType,
+      inline: isInlineImage(item.file.contentType),
+      url: item.url,
+    })),
+    verified: false,
+  };
+
+  // Сверка после записи: документ перечитывается, и в нём ищется каждое вложение.
+  let check: Doc;
+  try {
+    check = await loadDoc(rm, doc.id);
+  } catch (error) {
+    process.exitCode = 1;
+    emit(result, () =>
+      `Файлы приложены к «${doc.title}», но перечитать документ для сверки не удалось: ${describeFailure(error)}\n` +
+        `Проверьте документ сами, команду не повторяйте — файлы загрузились бы второй раз: ${docUrl(rm, doc)}`,
+    );
+    return;
+  }
+  const missing = attached.filter((item) => !check.text.includes(item.id));
+  result.verified = missing.length === 0;
+  if (missing.length > 0) {
+    process.exitCode = 1;
+    emit({ ...result, missing: missing.map((item) => item.id), appendix }, () =>
+      `Файлы загружены, но при сверке в документе «${doc.title}» нет ссылок на: ` +
+        `${missing.map((item) => item.file.name).join(", ")}.\n` +
+        `Допишите в конец документа вручную:\n${RULE}\n${appendix.trim()}\n${RULE}`,
+    );
+    return;
+  }
+  emit(result, () =>
+    [
+      `Приложено к «${doc.title}» · инстанс ${rm.name}`,
+      docUrl(rm, doc),
+      ...attached.map(
+        (item, index) =>
+          `  ${index + 1}. ${item.file.name} — ${formatBytes(item.file.size)}, ` +
+          `${isInlineImage(item.file.contentType) ? "картинкой" : "вложением"}`,
+      ),
+      `Сверка: документ перечитан, ссылки на все вложения (${attached.length}) на месте.`,
+    ].join("\n"),
+  );
+}
+
 async function cmdScan(args: Args): Promise<void> {
   const file = str(args, "file");
   const text = file ? await Bun.file(file).text() : (str(args, "text") ?? args.positional.join(" "));
@@ -928,7 +1940,7 @@ function cmdHelp(): void {
 
 Общие флаги: --instance <имя>  --json  --no-cache
 
-ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: create, update, publish, share, move, archive, delete
+ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: create, update, publish, share, move, archive, delete, attach
 без --yes печатают полный предпросмотр и ничего не меняют. Текст документа проверяется
 на компрометацию: черновик — по внутренней планке, публикация и ссылка — по клиентской.
 
@@ -952,6 +1964,11 @@ function cmdHelp(): void {
   archive <id> [--yes] | delete <id> [--permanent] --yes
   export <id> --out файл.md
 
+Вложения — вашим ключом и от вашего имени
+  attach <id|url> (--file путь | --url https-ссылка)… [--comment "…"] [--max-mb N] [--yes]
+                                    загрузить файлы и дописать ссылки на них в конец документа;
+                                    --file и --url повторяемы, ссылка печатается только хостом и путём
+
 Ссылки для клиентов
   share <id|url> [--children] [--yes]   выдать публичную ссылку
   shares [--document <id>]              что выдано: просмотры и последнее обращение
@@ -970,6 +1987,7 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   jsonMode = bool(args, "json");
   noCache = bool(args, "no-cache") || bool(args, "refresh");
+  await purgeStaleDownloads();
 
   if (args.cmd === "help" || bool(args, "help")) return cmdHelp();
   if (args.cmd === "instances" || args.cmd === "config") return cmdInstances(args);
@@ -995,6 +2013,7 @@ async function main(): Promise<void> {
     archive: cmdArchive,
     delete: cmdDelete,
     export: cmdExport,
+    attach: cmdAttach,
   };
   const handler = handlers[args.cmd];
   if (!handler) throw new UserError(`Неизвестная команда "${args.cmd}". Список команд: outline.ts help`);
@@ -1005,9 +2024,10 @@ async function run(): Promise<void> {
   try {
     await main();
   } catch (error) {
-    if (error instanceof UserError) console.error(`Ошибка: ${error.message}`);
-    else if (error instanceof ApiError) console.error(`Outline API: ${error.message}`);
-    else console.error(`Сбой: ${error instanceof Error ? error.message : String(error)}`);
+    // redact — последний рубеж: ссылки --url с токеном не печатаются даже в чужом тексте ошибки.
+    if (error instanceof UserError) console.error(redact(`Ошибка: ${error.message}`));
+    else if (error instanceof ApiError) console.error(redact(`Outline API: ${error.message}`));
+    else console.error(redact(`Сбой: ${error instanceof Error ? error.message : String(error)}`));
     process.exitCode = 1;
   }
 }
@@ -1015,4 +2035,17 @@ async function run(): Promise<void> {
 // Импорт модуля (тесты) не должен запускать CLI.
 if (import.meta.main) await run();
 
-export { documentRef, clip };
+export {
+  documentRef,
+  clip,
+  filenameFromDisposition,
+  fileNameFromUrl,
+  cleanFileName,
+  contentTypeFor,
+  attachmentTitle,
+  appendixMarkdown,
+  safeUrl,
+  formatBytes,
+  outlineLimit,
+  isInlineImage,
+};

@@ -1641,6 +1641,11 @@ async function cmdPublish(rm: Resolved, args: Args): Promise<void> {
   emit(updated, () => `Опубликован: ${updated.title}\n${docUrl(rm, updated)}`);
 }
 
+/**
+ * Выдать публичную ссылку. Открывает она ровно то, что показал предпросмотр: без --children — только
+ * сам документ, с --children — и все вложенные. После записи ссылка перечитывается и сверяется
+ * с запрошенным: вложенные, открытые вопреки просьбе, — утечка наружу, о ней сказано прямо, код 1.
+ */
 async function cmdShare(rm: Resolved, args: Args): Promise<void> {
   const value = args.positional[0] ?? str(args, "id");
   if (!value) throw new UserError("Укажите документ: outline.ts share <id|url>");
@@ -1650,19 +1655,60 @@ async function cmdShare(rm: Resolved, args: Args): Promise<void> {
   // Ссылка делает документ доступным всем, у кого она есть, — это публикация наружу.
   checkOutgoing({ название: doc.title, текст: doc.text }, args, "client");
 
+  // Второй ссылки на документ shares.create не выдаёт: свою, не отозванную, он возвращает как есть,
+  // и запись меняет её. Поэтому предпросмотр говорит, что в ней сейчас и что поменяется.
+  let links: DocumentLinks | null = null;
+  let linksError = "";
+  try {
+    links = await documentLinks(rm, doc);
+  } catch (error) {
+    linksError = error instanceof ApiError ? `${error.status} ${error.code}` : networkReason(error);
+  }
+  const existing = links?.own ?? null;
+  const opens = (children: boolean): string => (children ? "документ и все вложенные" : "только сам документ");
+
   const warnings: string[] = [];
   if (!doc.publishedAt) warnings.push("документ ещё черновик — по ссылке он будет доступен как есть");
   if (doc.archivedAt) warnings.push("документ в архиве");
+  if (existing?.published && existing.includeChildDocuments === true && !withChildren) {
+    warnings.push("сейчас по ссылке открыты и вложенные документы — после записи они закроются, останется только сам документ");
+  }
+  if (existing?.published && existing.includeChildDocuments !== true && withChildren) {
+    warnings.push("сейчас по ссылке открыт только сам документ — после записи откроются и все вложенные");
+  }
+  if (existing && !existing.published) {
+    warnings.push(
+      `ссылка ${existing.url} снята с публикации — после записи этот адрес снова откроется, ` +
+        "в том числе у тех, кому его давали раньше",
+    );
+  }
+  if (withChildren) {
+    warnings.push("текст вложенных документов в предпросмотр не входит и не проверялся — прочитайте их до выдачи");
+  }
+  for (const link of links?.inherited ?? []) warnings.push(`документ уже открыт без входа: ${linkOrigin(link)} — ${link.share.url}`);
+  if (links?.ownHidden) {
+    warnings.push(
+      "есть ли у черновика вне коллекции своя ссылка, Outline не сообщает; если есть — запись снова откроет её прежний адрес",
+    );
+  }
+  if (linksError) warnings.push(`есть ли у документа ссылка, проверить не удалось (${linksError})`);
 
   const preview =
     `ПУБЛИЧНАЯ ССЫЛКА · инстанс ${rm.name}\n` +
     table([
       ["Документ", doc.title],
       ["Адрес внутри", docUrl(rm, doc)],
+      [
+        "Ссылка",
+        !existing
+          ? "будет выдана новая"
+          : `уже есть: ${existing.url} — ` +
+            (existing.published ? `открывает ${opens(existing.includeChildDocuments === true)}` : "снята с публикации"),
+      ],
       ["Вложенные документы", withChildren ? "включены в ссылку" : "не включены"],
       ["Кто увидит", "любой, у кого есть ссылка, без входа в Outline"],
     ]) +
-    (warnings.length ? `\n\nВнимание: ${warnings.join("; ")}.` : "") +
+    (warnings.length ? `\n\nВнимание:\n${warnings.map((w) => `  — ${w}`).join("\n")}` : "") +
     `\n\nТЕКСТ, КОТОРЫЙ УВИДИТ ПОЛУЧАТЕЛЬ:\n${RULE}\n${clip(doc.text, 2000)}\n${RULE}`;
   if (!requireConfirmation(args, preview)) return;
 
@@ -1670,10 +1716,76 @@ async function cmdShare(rm: Resolved, args: Args): Promise<void> {
     documentId: doc.id,
     includeChildDocuments: withChildren,
   });
-  // shares.create возвращает ссылку, но публичной её делает флаг published.
-  const published = await api<Share>(rm, "shares.update", { id: share.id, published: true });
-  emit(published, () =>
-    `Ссылка выдана: ${published.url}\nДокумент: ${doc.title}\nОтозвать: outline.ts unshare ${published.id} --yes`,
+  // Публичной ссылку делает published. Outline 1.10.1 (server/routes/api/shares/shares.ts,
+  // обработчик shares.update) при published: true сам ставит includeChildDocuments = true и только
+  // потом применяет includeChildDocuments из запроса. Поэтому флаг идёт явно и в том же запросе:
+  // без него ссылка, выданная без --children, открыла бы и все вложенные документы.
+  const published = await api<Share>(rm, "shares.update", {
+    id: share.id,
+    published: true,
+    includeChildDocuments: withChildren,
+  });
+
+  // Сверка: ссылка перечитывается — по документу (там она в любом состоянии), а у черновика вне
+  // коллекции — по её id — и то, что она открывает, сравнивается с запрошенным.
+  let reread: Share | null = null;
+  let rereadError = "";
+  try {
+    reread =
+      (await sharesInfo(rm, { documentId: doc.id })).find((s) => s.id === published.id) ??
+      (await sharesInfo(rm, { id: published.id }))[0] ??
+      null;
+  } catch (error) {
+    rereadError = error instanceof ApiError ? `${error.status} ${error.code}` : networkReason(error);
+  }
+  const result = { ...(reread ?? published), requested: { includeChildDocuments: withChildren }, verified: false };
+  if (!reread || typeof reread.includeChildDocuments !== "boolean") {
+    process.exitCode = 1;
+    const why = !reread
+      ? `перечитать её не удалось${rereadError ? ` (${rereadError})` : ""}`
+      : "Outline не сообщил, открывает ли она вложенные документы";
+    emit(result, () =>
+      `Ссылка выдана: ${published.url}, но сверить её не удалось: ${why}.\n` +
+        `Проверьте, что она открывает: outline.ts shares --document ${doc.id}`,
+    );
+    return;
+  }
+  const mismatch: string[] = [];
+  if (reread.published !== true) {
+    mismatch.push(
+      `РАСХОЖДЕНИЕ: после записи ссылка ${reread.url} не опубликована — без входа она не откроется. ` +
+        `Повторите: outline.ts share ${doc.id}${withChildren ? " --children" : ""}`,
+    );
+  }
+  if (reread.includeChildDocuments && !withChildren) {
+    mismatch.push(
+      `РАСХОЖДЕНИЕ: просили открыть только документ «${doc.title}», а ссылка ${reread.url} открывает и все ` +
+        `вложенные документы — без входа, любому, у кого она есть.`,
+      `Закрыть утечку сейчас — отозвать ссылку: outline.ts unshare ${reread.id} (предпросмотр, затем --yes). ` +
+        `Вложенные можно выключить и в настройках этой ссылки в самом Outline.`,
+    );
+  }
+  if (!reread.includeChildDocuments && withChildren) {
+    mismatch.push(
+      `РАСХОЖДЕНИЕ: просили открыть документ «${doc.title}» вместе с вложенными, а ссылка ${reread.url} ` +
+        `открывает только сам документ. Вложенные получателю не откроются; если они нужны — повторите: ` +
+        `outline.ts share ${doc.id} --children`,
+    );
+  }
+  if (mismatch.length > 0) {
+    process.exitCode = 1;
+    emit(result, () => mismatch.join("\n"));
+    return;
+  }
+  result.verified = true;
+  emit(result, () =>
+    [
+      `Ссылка выдана: ${reread.url}`,
+      `Документ: ${doc.title}`,
+      `Открывает: ${opens(withChildren)}`,
+      "Сверка: ссылка перечитана — открывает ровно то, что в предпросмотре.",
+      `Отозвать: outline.ts unshare ${reread.id}`,
+    ].join("\n"),
   );
 }
 
@@ -2284,7 +2396,8 @@ function cmdHelp(): void {
                                     --file и --url повторяемы, ссылка печатается только хостом и путём
 
 Ссылки для клиентов
-  share <id|url> [--children] [--yes]   выдать публичную ссылку
+  share <id|url> [--children] [--yes]   выдать публичную ссылку: без --children — только сам документ,
+                                        с --children — и все вложенные; после записи сверяется
   shares [--document <id|url>]          что выдано: просмотры и последнее обращение; по документу —
                                         своя ссылка и унаследованные (на коллекцию, на родителя)
   unshare <docId|shareId|url> [--yes]   отозвать ссылку; по документу — только его собственную,

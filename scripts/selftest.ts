@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * Самопроверка скилла без обращения к настоящему Outline: разбор ссылок, правила проверки текстов
- * и команды attach, shares и unshare — против поддельного Outline и поддельной раздачи файлов
+ * и команды attach, share, shares и unshare — против поддельного Outline и поддельной раздачи файлов
  * на этой же машине.
  * Запуск: bun scripts/selftest.ts — код возврата 1, если хоть один случай не прошёл.
  * Нужен openssl: раздача файлов работает только по https, и для неё выпускается одноразовый сертификат.
@@ -173,13 +173,13 @@ check(
   "976,56 КБ",
 );
 
-// ── attach, shares и unshare против поддельного Outline ───────────────
+// ── attach, share, shares и unshare против поддельного Outline ────────
 
 /**
  * Поддельный Outline (http, эта машина) изображает API 1.10.1: documents.info/update с номером
- * правки, collections.list, shares.info (по id ссылки, документу и коллекции), shares.list,
- * shares.revoke и attachments.create во всех трёх режимах загрузки — локальное хранилище
- * (/api/files.create), внешнее по подписанной форме (S3 POST) и подписанный PUT.
+ * правки, collections.list, shares.info (по id ссылки, документу и коллекции), shares.create,
+ * shares.update, shares.list, shares.revoke и attachments.create во всех трёх режимах загрузки —
+ * локальное хранилище (/api/files.create), внешнее по подписанной форме (S3 POST) и подписанный PUT.
  * Поддельная раздача файлов (https с одноразовым сертификатом) отдаёт файл по одноразовой ссылке.
  * CLI запускается отдельным процессом с HOME во временном каталоге: настоящий конфиг не читается,
  * в сеть дальше этой машины ничего не уходит.
@@ -223,6 +223,8 @@ type FakeDoc = {
   failUpload?: string;
   /** Ключ ограничен по областям доступа без files.*: /api/files.create с ним отвечает 403. */
   scopedKey?: boolean;
+  /** shares.update не применяет includeChildDocuments из запроса: published: true открывает и вложенные. */
+  stubbornChildren?: boolean;
 };
 
 type FakeShare = {
@@ -344,6 +346,18 @@ async function runOutlineScenarios(work: string, servers: ReturnType<typeof Bun.
   addShare(967, { documentId: addDoc(27, "Blocked027", { title: "Обмен выключен" }).id, blocked: true });
   const loneDraft = addDoc(28, "LoneDraft8", { title: "Личный черновик", collectionId: null });
   addShare(968, { documentId: loneDraft.id });
+  // Для share: без ссылки; с опубликованной ссылкой со вложенными и без них; со снятой с публикации;
+  // на сервере, который флаг вложенных из запроса не применяет.
+  const toShare = addDoc(30, "ToShare030", { title: "Инструкция по обмену" });
+  const toShareWithKids = addDoc(31, "ToShare031", { title: "Раздел инструкций" });
+  const sharedWithKids = addDoc(32, "Shared0032", { title: "Открыт со вложенными" });
+  addShare(970, { documentId: sharedWithKids.id, includeChildDocuments: true });
+  const sharedAlone = addDoc(33, "Shared0033", { title: "Открыт без вложенных" });
+  addShare(971, { documentId: sharedAlone.id });
+  const sharedBefore = addDoc(34, "Shared0034", { title: "Ссылку снимали" });
+  addShare(972, { documentId: sharedBefore.id, published: false });
+  const stubborn = addDoc(35, "Stubborn35", { title: "Вложенные открываются всегда", stubbornChildren: true });
+  let nextShare = 980;
 
   const log: Logged[] = [];
   const pending = new Map<string, { id: string; doc: FakeDoc; name: string; size: number }>();
@@ -505,6 +519,36 @@ async function runOutlineScenarios(work: string, servers: ReturnType<typeof Bun.
             .map((id) => shareStore.find((s) => open(s) && s.documentId === id && s.includeChildDocuments))
             .find((s) => s !== undefined);
         return json(200, { ok: true, data: { shares: [own, ...(parent ? [parent] : [])].map(presentShare) } });
+      }
+      case "/api/shares.create": {
+        // Как в 1.10.1 (findOrCreate): своя не отозванная ссылка документа возвращается как есть,
+        // новая создаётся с includeChildDocuments = published || includeChildDocuments.
+        const doc = [...docs.values()].find((d) => d.id === body.documentId);
+        if (!doc) return json(404, { ok: false, error: "not_found", message: "Resource not found" });
+        const published = body.published === true;
+        const share =
+          shareStore.find((s) => s.documentId === doc.id && !s.revoked) ??
+          addShare(nextShare++, {
+            documentId: doc.id,
+            published,
+            includeChildDocuments: published || body.includeChildDocuments === true,
+          });
+        return json(200, { ok: true, data: presentShare(share) });
+      }
+      case "/api/shares.update": {
+        // Как в 1.10.1: published: true сам ставит includeChildDocuments = true, а флаг из запроса
+        // применяется после. stubbornChildren — сервер, который этот флаг не применяет.
+        const share = shareStore.find((s) => s.id === body.id && !s.revoked);
+        if (!share) return json(404, { ok: false, error: "not_found", message: "Resource not found" });
+        if (typeof body.published === "boolean") {
+          share.published = body.published;
+          if (body.published) share.includeChildDocuments = true;
+        }
+        const stubbornServer = share.documentId ? docs.get(share.documentId)?.stubbornChildren : false;
+        if (typeof body.includeChildDocuments === "boolean" && !stubbornServer) {
+          share.includeChildDocuments = body.includeChildDocuments;
+        }
+        return json(200, { ok: true, data: presentShare(share) });
       }
       case "/api/shares.list":
         return json(200, {
@@ -1104,6 +1148,80 @@ async function runOutlineScenarios(work: string, servers: ReturnType<typeof Bun.
     "unshare <адрес ссылки черновика вне коллекции>: по адресу она отзывается",
     [loneByLink.code, revokes(loneByLink.requests)],
     [0, [{ id: uuid(968) }]],
+  );
+
+  // ── share: ссылка открывает ровно то, что показал предпросмотр ──
+  const shareUpdates = (requests: Logged[]): Record<string, unknown>[] =>
+    requests
+      .filter((r) => r.path === "/api/shares.update")
+      .map((r) => pick(r.body, ["published", "includeChildDocuments"]));
+
+  // 22. Без --children: 1.10.1 при published: true сам включает вложенные, поэтому в том же
+  // shares.update уходит includeChildDocuments: false; ссылка перечитывается и сверяется.
+  const shareAlone = await cli("share", toShare.urlId, "--yes");
+  check(
+    "share без --children: в shares.update вместе с published уходит includeChildDocuments: false",
+    [shareAlone.code, shareUpdates(shareAlone.requests)],
+    [0, [{ published: true, includeChildDocuments: false }]],
+  );
+  check(
+    "share без --children: ссылка перечитана после записи, сверка прошла, вложенные закрыты",
+    [
+      paths(shareAlone.requests).at(-1),
+      shareAlone.out.includes("Сверка"),
+      shareStore.find((s) => s.documentId === toShare.id)?.includeChildDocuments,
+    ],
+    ["shares.info", true, false],
+  );
+  // 23. С --children — includeChildDocuments: true.
+  const shareWithKids = await cli("share", toShareWithKids.urlId, "--children", "--yes");
+  check(
+    "share --children: includeChildDocuments: true, сверка прошла",
+    [shareWithKids.code, shareUpdates(shareWithKids.requests), shareWithKids.out.includes("Сверка")],
+    [0, [{ published: true, includeChildDocuments: true }], true],
+  );
+
+  // 24. Ссылка уже есть: предпросмотр говорит, что в ней сейчас и что поменяется.
+  const narrowing = await cli("share", sharedWithKids.urlId);
+  check(
+    "share без --children, ссылка уже со вложенными: предпросмотр — вложенные открыты и закроются",
+    [
+      narrowing.code,
+      narrowing.out.includes("открыты и вложенные документы — после записи они закроются"),
+      shareUpdates(narrowing.requests).length,
+    ],
+    [0, true, 0],
+  );
+  const narrowed = await cli("share", sharedWithKids.urlId, "--yes");
+  check(
+    "share без --children, ссылка уже со вложенными: та же ссылка, вложенные закрыты",
+    [narrowed.code, shareUpdates(narrowed.requests), shareStore.find((s) => s.id === uuid(970))?.includeChildDocuments],
+    [0, [{ published: true, includeChildDocuments: false }], false],
+  );
+  const widening = await cli("share", sharedAlone.urlId, "--children");
+  check(
+    "share --children, ссылка без вложенных: предпросмотр — после записи откроются и вложенные",
+    [widening.code, widening.out.includes("после записи откроются и все вложенные")],
+    [0, true],
+  );
+  const reopening = await cli("share", sharedBefore.urlId);
+  check(
+    "share, ссылка снята с публикации: предпросмотр — прежний адрес снова откроется",
+    [reopening.code, reopening.out.includes(`/s/${uuid(972)}`) && reopening.out.includes("снова откроется")],
+    [0, true],
+  );
+
+  // 25. Сервер всё равно открыл вложенные: РАСХОЖДЕНИЕ словами, как закрыть, код 1.
+  const overshared = await cli("share", stubborn.urlId, "--yes");
+  check(
+    "share, сервер открыл вложенные вопреки запросу: РАСХОЖДЕНИЕ, как закрыть, код 1",
+    [
+      overshared.code,
+      overshared.out.includes("РАСХОЖДЕНИЕ"),
+      overshared.out.includes("outline.ts unshare "),
+      overshared.out.includes("Сверка"),
+    ],
+    [1, true, true, false],
   );
 }
 

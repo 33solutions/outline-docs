@@ -23,14 +23,14 @@
 | Перемещение | `documents.move` | `{ id, collectionId?, parentDocumentId? }` |
 | Архив / удаление | `documents.archive`, `documents.delete` | `{ id }`, `{ id, permanent? }` |
 | Выгрузка | `documents.export` | `{ id }` → строка Markdown |
-| Выдать ссылку | `shares.create` | `{ documentId, includeChildDocuments? }` |
-| Сделать публичной | `shares.update` | `{ id, published: true }` |
+| Выдать ссылку | `shares.create` | `{ documentId, includeChildDocuments? }` — существующую ссылку документа возвращает как есть |
+| Сделать публичной | `shares.update` | `{ id, published: true, includeChildDocuments }` — флаг вложенных обязательно явно |
 | Список ссылок | `shares.list` | `{ offset, limit }` — опубликованные; не администратор видит только выданные им |
 | Отозвать ссылку | `shares.revoke` | `{ id }` — uuid ссылки → `{ success: true }` без `data` |
 
 ## Ловушки
 
-1. **`shares.create` не делает ссылку публичной.** Он создаёт объект share и возвращает URL, но до `shares.update { published: true }` ссылка требует входа. CLI выполняет оба шага.
+1. **`shares.create` не делает ссылку публичной.** Он создаёт объект share и возвращает URL, но до `shares.update { published: true }` ссылка требует входа. CLI выполняет оба шага. В 1.10 `shares.update` при `published: true` сам ставит `includeChildDocuments = true` и лишь затем применяет `includeChildDocuments` из запроса, поэтому без явного флага в том же запросе ссылка открывает и все вложенные документы; CLI передаёт его всегда и после записи перечитывает ссылку. `shares.create` вторую ссылку на документ не выдаёт: существующую, не отозванную, он возвращает как есть, вместе с её прежними настройками.
 2. **Публикация документа и публичная ссылка — разные вещи.** `documents.update { publish: true }` делает черновик видимым команде по правам коллекции; доступ без входа даёт только опубликованная ссылка.
 3. **Обмен ссылками отключается на уровне коллекции и всего пространства.** Отказ `authorization_error` при `shares.create` — это настройка администратора, а не ошибка запроса.
 4. **`documents.update` заменяет текст целиком.** Чтобы дописать, нужен `append: true` (в 1.10 — `editMode: "append"`, а `append` оставлен для совместимости); иначе документ перезаписывается — поэтому CLI в предпросмотре явно говорит, заменяется текст или дописывается.

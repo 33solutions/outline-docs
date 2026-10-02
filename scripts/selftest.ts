@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 /**
  * Самопроверка скилла без обращения к настоящему Outline: разбор ссылок, правила проверки текстов
- * и команда attach — против поддельного Outline и поддельной раздачи файлов на этой же машине.
+ * и команды attach, shares и unshare — против поддельного Outline и поддельной раздачи файлов
+ * на этой же машине.
  * Запуск: bun scripts/selftest.ts — код возврата 1, если хоть один случай не прошёл.
  * Нужен openssl: раздача файлов работает только по https, и для неё выпускается одноразовый сертификат.
  */
@@ -172,23 +173,24 @@ check(
   "976,56 КБ",
 );
 
-// ── attach против поддельного Outline ─────────────────────────────────
+// ── attach, shares и unshare против поддельного Outline ───────────────
 
 /**
  * Поддельный Outline (http, эта машина) изображает API 1.10.1: documents.info/update с номером
- * правки, collections.list, shares.info и attachments.create во всех трёх режимах загрузки —
- * локальное хранилище (/api/files.create), внешнее по подписанной форме (S3 POST) и подписанный PUT.
+ * правки, collections.list, shares.info (по id ссылки, документу и коллекции), shares.list,
+ * shares.revoke и attachments.create во всех трёх режимах загрузки — локальное хранилище
+ * (/api/files.create), внешнее по подписанной форме (S3 POST) и подписанный PUT.
  * Поддельная раздача файлов (https с одноразовым сертификатом) отдаёт файл по одноразовой ссылке.
  * CLI запускается отдельным процессом с HOME во временном каталоге: настоящий конфиг не читается,
  * в сеть дальше этой машины ничего не уходит.
  */
-async function attachScenarios(): Promise<void> {
+async function outlineScenarios(): Promise<void> {
   const work = await mkdtemp(join(tmpdir(), "outline-docs-selftest-"));
   const servers: ReturnType<typeof Bun.serve>[] = [];
   try {
-    await runAttachScenarios(work, servers);
+    await runOutlineScenarios(work, servers);
   } catch (error) {
-    failures.push(`сценарии attach прерваны: ${error instanceof Error ? error.message : String(error)}`);
+    failures.push(`сценарии против поддельного Outline прерваны: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     for (const server of servers) await server.stop(true);
     await rm(work, { recursive: true, force: true });
@@ -212,7 +214,8 @@ type FakeDoc = {
   title: string;
   text: string;
   revision: number;
-  collectionId: string;
+  /** null — черновик вне коллекции. */
+  collectionId: string | null;
   parentDocumentId?: string;
   upload: "local" | "external" | "put";
   readOnly?: boolean;
@@ -220,10 +223,27 @@ type FakeDoc = {
   failUpload?: string;
   /** Ключ ограничен по областям доступа без files.*: /api/files.create с ним отвечает 403. */
   scopedKey?: boolean;
-  shares?: Record<string, unknown>[];
 };
 
-async function runAttachScenarios(work: string, servers: ReturnType<typeof Bun.serve>[]): Promise<void> {
+type FakeShare = {
+  id: string;
+  documentId: string | null;
+  collectionId: string | null;
+  published: boolean;
+  includeChildDocuments: boolean;
+  /** Слаг вместо id в адресе …/s/<слаг>. */
+  urlId?: string;
+  views?: number;
+  /** Выдана коллегой: отозвать её может он сам или администратор, но не владелец ключа. */
+  foreign?: boolean;
+  /** Обмен ссылками выключен в коллекции: shares.info по id ссылки отвечает 403. */
+  blocked?: boolean;
+  revoked?: boolean;
+};
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function runOutlineScenarios(work: string, servers: ReturnType<typeof Bun.serve>[]): Promise<void> {
   const KEY = "selftest-key";
   const LIMIT = 1_000_000;
   const home = join(work, "home");
@@ -246,7 +266,9 @@ async function runAttachScenarios(work: string, servers: ReturnType<typeof Bun.s
     issued = false;
   }
   if (!issued) {
-    failures.push("сценарии attach: нужен openssl — им выпускается сертификат для поддельной https-раздачи файлов");
+    failures.push(
+      "сценарии против поддельного Outline: нужен openssl — им выпускается сертификат для поддельной https-раздачи файлов",
+    );
     return;
   }
 
@@ -257,8 +279,21 @@ async function runAttachScenarios(work: string, servers: ReturnType<typeof Bun.s
     { id: uuid(902), name: "Документация для клиентов" },
     { id: uuid(903), name: "Открытые материалы" },
   ];
-  /** Ссылка на всю коллекцию: shares.info { collectionId }. */
-  const collectionShares = new Map([[uuid(903), [{ id: uuid(951), collectionId: uuid(903), documentId: null, published: true }]]]);
+  /** Все публичные ссылки пространства — на документы и на коллекции; отзыв помечает их revoked. */
+  const shareStore: FakeShare[] = [];
+  const addShare = (n: number, extra: Partial<FakeShare>): FakeShare => {
+    const share: FakeShare = {
+      id: uuid(n),
+      documentId: null,
+      collectionId: null,
+      published: true,
+      includeChildDocuments: false,
+      ...extra,
+    };
+    shareStore.push(share);
+    return share;
+  };
+  addShare(951, { collectionId: uuid(903), includeChildDocuments: true }); // вся коллекция «Открытые материалы»
   const ORIGINAL = "# Подключение\n\nИсходный текст документа, который писали люди.";
   const docs = new Map<string, FakeDoc>();
   const addDoc = (n: number, urlId: string, extra: Partial<FakeDoc> = {}): FakeDoc => {
@@ -277,11 +312,8 @@ async function runAttachScenarios(work: string, servers: ReturnType<typeof Bun.s
     return doc;
   };
   const plain = addDoc(1, "Plain00001", { title: "Подключение к обмену" });
-  const forClients = addDoc(2, "Client0002", {
-    title: "Инструкция для клиентов",
-    collectionId: uuid(902),
-    shares: [{ id: uuid(950), documentId: uuid(2), published: true }],
-  });
+  const forClients = addDoc(2, "Client0002", { title: "Инструкция для клиентов", collectionId: uuid(902) });
+  addShare(950, { documentId: forClients.id });
   const busy = addDoc(3, "Busy000003", { colleagueEdit: "pending" });
   const external = addDoc(4, "Extern0004", { upload: "external" });
   const viaPutDoc = addDoc(5, "Put0000005", { upload: "put" });
@@ -290,10 +322,28 @@ async function runAttachScenarios(work: string, servers: ReturnType<typeof Bun.s
   const scopedDoc = addDoc(8, "Scoped0008", { scopedKey: true });
   // Чужие ссылки: на всю коллекцию; на родителя вместе с вложенными; на родителя без вложенных.
   const inOpenCollection = addDoc(9, "OpenColl09", { collectionId: uuid(903) });
-  addDoc(10, "Parent0010", { shares: [{ id: uuid(952), documentId: uuid(10), published: true, includeChildDocuments: true }] });
+  addShare(952, { documentId: addDoc(10, "Parent0010").id, includeChildDocuments: true });
   const underSharedParent = addDoc(11, "Child00011", { parentDocumentId: uuid(10) });
-  addDoc(12, "Parent0012", { shares: [{ id: uuid(953), documentId: uuid(12), published: true, includeChildDocuments: false }] });
+  addShare(953, { documentId: addDoc(12, "Parent0012").id, includeChildDocuments: false });
   const underNarrowShare = addDoc(13, "Child00013", { parentDocumentId: uuid(12) });
+  // Для shares и unshare: своя ссылка; своя и родителя со вложенными; ссылка по id и по слагу;
+  // своя, снятая с публикации; выданная коллегой; в коллекции, где обмен ссылками выключен;
+  // у черновика вне коллекции.
+  const reglament = addDoc(20, "Reglament20", { title: "Регламент обновления" });
+  addShare(960, { documentId: reglament.id, views: 47 });
+  const section = addDoc(21, "Section021", { title: "Раздел для клиентов" });
+  addShare(961, { documentId: section.id, includeChildDocuments: true });
+  const subsection = addDoc(22, "Subsect022", { title: "Подраздел", parentDocumentId: section.id });
+  addShare(962, { documentId: subsection.id });
+  addShare(963, { documentId: addDoc(23, "Memo000023", { title: "Памятка" }).id, urlId: "pamjatka-klienta" });
+  addShare(964, { documentId: addDoc(24, "Price00024", { title: "Прайс" }).id });
+  const withdrawn = addDoc(25, "Withdrawn5", { title: "Снятая ссылка" });
+  addShare(965, { documentId: withdrawn.id, published: false });
+  const colleagues = addDoc(26, "Colleague6", { title: "Ссылка коллеги" });
+  addShare(966, { documentId: colleagues.id, foreign: true });
+  addShare(967, { documentId: addDoc(27, "Blocked027", { title: "Обмен выключен" }).id, blocked: true });
+  const loneDraft = addDoc(28, "LoneDraft8", { title: "Личный черновик", collectionId: null });
+  addShare(968, { documentId: loneDraft.id });
 
   const log: Logged[] = [];
   const pending = new Map<string, { id: string; doc: FakeDoc; name: string; size: number }>();
@@ -318,6 +368,32 @@ async function runAttachScenarios(work: string, servers: ReturnType<typeof Bun.s
     createdAt: "2026-09-01T00:00:00.000Z",
     updatedAt: "2026-09-01T00:00:00.000Z",
   });
+  /** Ссылка в ответе — поля presentShare из 1.10.1; у ссылки на коллекцию documentId: null. */
+  const presentShare = (share: FakeShare): Record<string, unknown> => {
+    const doc = share.documentId ? docs.get(share.documentId) : undefined;
+    const collection = collectionsList.find((c) => c.id === share.collectionId);
+    return {
+      id: share.id,
+      sourceTitle: collection?.name ?? doc?.title,
+      collectionId: share.collectionId,
+      documentId: share.documentId,
+      documentTitle: doc?.title,
+      published: share.published,
+      url: `${base}s/${share.urlId ?? share.id}`,
+      urlId: share.urlId ?? null,
+      createdBy: { id: uuid(share.foreign ? 802 : 801), name: share.foreign ? "Коллега" : "Владелец ключа" },
+      includeChildDocuments: share.includeChildDocuments,
+      views: share.views ?? 0,
+      createdAt: "2026-09-01T00:00:00.000Z",
+      updatedAt: "2026-09-01T00:00:00.000Z",
+    };
+  };
+  /** Предки документа снизу вверх. */
+  const ancestors = (doc: FakeDoc): string[] => {
+    const out: string[] = [];
+    for (let id = doc.parentDocumentId; id && !out.includes(id); id = docs.get(id)?.parentDocumentId) out.push(id);
+    return out;
+  };
 
   const outline = Bun.serve({
     hostname: "127.0.0.1",
@@ -401,13 +477,55 @@ async function runAttachScenarios(work: string, servers: ReturnType<typeof Bun.s
       case "/api/collections.list":
         return json(200, { ok: true, data: collectionsList, pagination: { offset: 0, limit: 100 } });
       case "/api/shares.info": {
-        if (body.collectionId) {
-          const shares = collectionShares.get(String(body.collectionId));
-          return shares?.length ? json(200, { ok: true, data: { shares } }) : json(204, null);
+        // По id (или слагу) — загрузка публичной ссылки: только опубликованная и не отозванная, иначе 404;
+        // обмен ссылками в коллекции выключен — 403.
+        if (body.id !== undefined) {
+          const share = shareStore.find((s) => (s.id === body.id || s.urlId === body.id) && s.published && !s.revoked);
+          if (share?.blocked) return json(403, { ok: false, error: "authorization_error", message: "Authorization error" });
+          return share
+            ? json(200, { ok: true, data: { shares: [presentShare(share)], sharedTree: null, collection: null, document: null } })
+            : json(404, { ok: false, error: "not_found", message: "Resource not found" });
         }
-        // Как в 1.10.1: нет своей ссылки у документа — 204, даже если открыта коллекция или родитель.
-        const doc = docs.get(String(body.documentId));
-        return doc?.shares?.length ? json(200, { ok: true, data: { shares: doc.shares } }) : json(204, null);
+        // По коллекции и документу — как loadShareWithParent в 1.10.1: своя ссылка в любом состоянии
+        // публикации, а нет её — 204, даже если открыта коллекция или родитель. К ссылке документа
+        // добавляется одна родительская: на коллекцию, иначе ссылка предка вместе с вложенными.
+        // У черновика вне коллекции — 204 и при своей ссылке.
+        if (body.collectionId) {
+          const own = shareStore.find((s) => s.collectionId === body.collectionId && !s.revoked);
+          return own ? json(200, { ok: true, data: { shares: [presentShare(own)] } }) : json(204, null);
+        }
+        // documentId сверяется с id документа, как в запросе к базе: urlId сюда не годится.
+        const doc = [...docs.values()].find((d) => d.id === body.documentId);
+        const own = doc && shareStore.find((s) => s.documentId === doc.id && !s.revoked);
+        if (!doc || !own || !doc.collectionId) return json(204, null);
+        const open = (s: FakeShare): boolean => s.published && !s.revoked;
+        const parent =
+          shareStore.find((s) => open(s) && s.collectionId === doc.collectionId) ??
+          ancestors(doc)
+            .map((id) => shareStore.find((s) => open(s) && s.documentId === id && s.includeChildDocuments))
+            .find((s) => s !== undefined);
+        return json(200, { ok: true, data: { shares: [own, ...(parent ? [parent] : [])].map(presentShare) } });
+      }
+      case "/api/shares.list":
+        return json(200, {
+          ok: true,
+          data: shareStore.filter((s) => s.published && !s.revoked).map(presentShare),
+          pagination: { offset: 0, limit: 100 },
+        });
+      case "/api/shares.revoke": {
+        // Как в 1.10.1: id обязателен и только uuid; отзывает выдавший или администратор; ответ без data.
+        if (typeof body.id !== "string" || !UUID.test(body.id)) {
+          return json(400, {
+            ok: false,
+            error: "validation_error",
+            message: body.id === undefined ? "id: Invalid input: expected string, received undefined" : "id: Invalid UUID",
+          });
+        }
+        const share = shareStore.find((s) => s.id === body.id);
+        if (!share) return json(404, { ok: false, error: "not_found", message: "Resource not found" });
+        if (share.foreign) return json(403, { ok: false, error: "authorization_error", message: "Authorization error" });
+        share.revoked = true;
+        return json(200, { ok: true, success: true });
       }
       case "/api/attachments.create": {
         const doc = docs.get(String(body.documentId));
@@ -817,9 +935,179 @@ async function runAttachScenarios(work: string, servers: ReturnType<typeof Bun.s
     narrow.code === 0 && /Публичная ссылка\s+нет/.test(narrow.out) && !narrow.client,
     true,
   );
+
+  // ── shares и unshare: своя ссылка и унаследованные ──
+  const revokes = (requests: Logged[]): unknown[] =>
+    requests.filter((r) => r.path === "/api/shares.revoke").map((r) => r.body);
+  /** shares --document в JSON: код возврата и пары «чья ссылка — её id». */
+  const sharesOf = async (ref: string) => {
+    const run = await cli("shares", "--document", ref, "--json");
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(run.out);
+    } catch {
+      /* не JSON — проверка ниже не пройдёт */
+    }
+    const list = (parsed as { shares?: { via?: string; id?: string }[] } | null)?.shares ?? [];
+    return { code: run.code, links: list.map((s) => [s.via, s.id]) };
+  };
+
+  // 14. shares --document: Outline отдаёт списком свою ссылку, свою и родительскую или 204.
+  check("shares --document, только своя ссылка", await sharesOf(reglament.urlId), { code: 0, links: [["own", uuid(960)]] });
+  check("shares --document, своя и родителя со вложенными", await sharesOf(subsection.urlId), {
+    code: 0,
+    links: [
+      ["own", uuid(962)],
+      ["parent", uuid(961)],
+    ],
+  });
+  check("shares --document, своей нет (204), открыта коллекция", await sharesOf(inOpenCollection.urlId), {
+    code: 0,
+    links: [["collection", uuid(951)]],
+  });
+  check("shares --document, своей нет (204), открыт родитель", await sharesOf(underSharedParent.urlId), {
+    code: 0,
+    links: [["parent", uuid(952)]],
+  });
+  const noLinks = await cli("shares", "--document", plain.urlId);
+  check("shares --document, ссылок нет: так и сказано", noLinks.code === 0 && noLinks.out.includes("Публичной ссылки нет"), true);
+  const mixed = await cli("shares", "--document", subsection.urlId);
+  check(
+    "shares --document: своя и унаследованная отмечены, родитель назван",
+    mixed.code === 0 && /\sсвоя\s/.test(mixed.out) && mixed.out.includes("родителя «Раздел для клиентов»"),
+    true,
+  );
+  // Общий список: у ссылки на коллекцию нет documentId — таблица не должна на ней падать.
+  const listed = await cli("shares");
+  check("shares: ссылка на коллекцию в общем списке", listed.code === 0 && listed.out.includes("коллекция «Открытые"), true);
+
+  // 15. unshare по документу: без --yes — предпросмотр, с --yes — revoke ровно с id своей ссылки.
+  const unsharePreview = await cli("unshare", reglament.urlId);
+  check(
+    "unshare, предпросмотр: своя ссылка названа, отзыв не отправлен",
+    [
+      unsharePreview.code,
+      unsharePreview.out.includes(`/s/${uuid(960)}`),
+      unsharePreview.out.includes("--yes"),
+      revokes(unsharePreview.requests).length,
+    ],
+    [0, true, true, 0],
+  );
+  const unshared = await cli("unshare", reglament.urlId, "--yes");
+  check(
+    "unshare --yes: отозвана своя ссылка документа — по её id",
+    [unshared.code, revokes(unshared.requests)],
+    [0, [{ id: uuid(960) }]],
+  );
+  check("unshare --yes: сказано, что ссылка отозвана", unshared.out.includes("Ссылка отозвана"), true);
+  const again = await cli("unshare", reglament.urlId, "--yes");
+  check(
+    "unshare повторно: своей ссылки уже нет (204) — «публичной ссылки нет», отзыв не отправлен",
+    [again.code, again.out.includes("Публичной ссылки нет"), revokes(again.requests).length],
+    [0, true, 0],
+  );
+
+  // 16. Голый uuid документа — не id ссылки: отзывается своя, о родительской сказано, она не тронута.
+  const withParent = await cli("unshare", subsection.id, "--yes");
+  check(
+    "unshare <uuid документа>, своя и родителя: отозвана только своя",
+    [withParent.code, revokes(withParent.requests)],
+    [0, [{ id: uuid(962) }]],
+  );
+  check(
+    "unshare: сказано, что документ открыт ссылкой родителя, и где она",
+    withParent.out.includes("по-прежнему открыт") &&
+      withParent.out.includes("«Раздел для клиентов»") &&
+      withParent.out.includes(`/s/${uuid(961)}`),
+    true,
+  );
+
+  // 17. Своей нет, открыт унаследованной: чужое не отзывается, сказано, откуда ссылка и где отзывать.
+  const viaParentLink = await cli("unshare", underSharedParent.urlId, "--yes");
+  check(
+    "unshare, открыт ссылкой родителя: отзыв не отправлен, код 1",
+    [viaParentLink.code, revokes(viaParentLink.requests).length],
+    [1, 0],
+  );
+  check(
+    "unshare, открыт ссылкой родителя: названа она и команда для неё",
+    viaParentLink.out.includes("ссылка на родительский документ «Документ 10»") &&
+      viaParentLink.out.includes(`unshare ${uuid(952)}`),
+    true,
+  );
+  const viaCollectionLink = await cli("unshare", inOpenCollection.urlId, "--yes");
+  check(
+    "unshare, открыта вся коллекция: отзыв не отправлен, коллекция названа",
+    [
+      viaCollectionLink.code,
+      revokes(viaCollectionLink.requests).length,
+      viaCollectionLink.out.includes("ссылка на всю коллекцию «Открытые материалы»"),
+    ],
+    [1, 0, true],
+  );
+
+  // 18. Ссылок нет вовсе: так и сказано, revoke не отправляется.
+  const noShare = await cli("unshare", plain.urlId, "--yes");
+  check(
+    "unshare, ссылок нет: «публичной ссылки нет», отзыв не отправлен",
+    [noShare.code, noShare.out.includes("Публичной ссылки нет"), revokes(noShare.requests).length],
+    [0, true, 0],
+  );
+
+  // 19. Ссылка названа сама — по id и адресом со слагом: revoke уходит с её uuid, а не со слагом.
+  const byShareId = await cli("unshare", uuid(964), "--yes");
+  check("unshare <id ссылки>: отозвана она", [byShareId.code, revokes(byShareId.requests)], [0, [{ id: uuid(964) }]]);
+  const bySlug = await cli("unshare", `${base}s/pamjatka-klienta`, "--yes");
+  check("unshare <адрес со слагом>: revoke с uuid ссылки", [bySlug.code, revokes(bySlug.requests)], [0, [{ id: uuid(963) }]]);
+
+  // 20. Своя ссылка снята с публикации; ссылку выдал коллега; обмен ссылками выключен; чужой uuid.
+  const withdrawnPreview = await cli("unshare", withdrawn.urlId);
+  check(
+    "unshare, своя ссылка снята с публикации: сказано в предпросмотре",
+    withdrawnPreview.code === 0 && withdrawnPreview.out.includes("снята с публикации"),
+    true,
+  );
+  const notMine = await cli("unshare", colleagues.urlId, "--yes");
+  check(
+    "unshare, ссылку выдал коллега: отказ Outline словами",
+    [notMine.code, notMine.err.includes("отзывает тот, кто её выдал"), revokes(notMine.requests)],
+    [1, true, [{ id: uuid(966) }]],
+  );
+  const sharingOff = await cli("unshare", uuid(967), "--yes");
+  check(
+    "unshare, обмен ссылками выключен (403 на ссылку): объяснено словами, отзыв не отправлен",
+    [sharingOff.code, sharingOff.err.includes("публичные ссылки запрещены"), revokes(sharingOff.requests).length],
+    [1, true, 0],
+  );
+  const stranger = await cli("unshare", uuid(777), "--yes");
+  check(
+    "unshare, неизвестный uuid: отказ словами, отзыв не отправлен",
+    [stranger.code, stranger.err.includes("Ни публичной ссылки, ни документа"), revokes(stranger.requests).length],
+    [1, true, 0],
+  );
+
+  // 21. Черновик вне коллекции: своя ссылка есть, но по документу 1.10.1 отвечает 204 — это не «ссылки нет».
+  const lone = await cli("unshare", loneDraft.urlId, "--yes");
+  check(
+    "unshare, черновик вне коллекции: сказано, что ссылка не видна, а не что её нет; отзыв не отправлен",
+    [lone.code, lone.out.includes("черновик вне коллекции"), lone.out.includes("Публичной ссылки нет"), revokes(lone.requests).length],
+    [1, true, false, 0],
+  );
+  const loneExposure = await exposed(loneDraft.urlId);
+  check(
+    "attach, черновик вне коллекции: открыт ли он, неизвестно — планка клиентская",
+    loneExposure.code === 0 && loneExposure.client && loneExposure.out.includes("черновик вне коллекции"),
+    true,
+  );
+  const loneByLink = await cli("unshare", `${base}s/${uuid(968)}`, "--yes");
+  check(
+    "unshare <адрес ссылки черновика вне коллекции>: по адресу она отзывается",
+    [loneByLink.code, revokes(loneByLink.requests)],
+    [0, [{ id: uuid(968) }]],
+  );
 }
 
-await attachScenarios();
+await outlineScenarios();
 
 // ── итог ──────────────────────────────────────────────────────────────
 console.log(`Проверок пройдено: ${passed}`);

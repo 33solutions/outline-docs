@@ -236,7 +236,12 @@ type Doc = {
 
 type Share = {
   id: string;
-  documentId: string;
+  /** null — у ссылки на всю коллекцию. */
+  documentId: string | null;
+  /** Есть у ссылки на всю коллекцию. */
+  collectionId?: string | null;
+  /** Что открывает ссылка: название коллекции или документа (1.10). */
+  sourceTitle?: string;
   documentTitle?: string;
   documentUrl?: string;
   published: boolean;
@@ -463,6 +468,112 @@ async function readBody(args: Args): Promise<string | undefined> {
   if (inline !== undefined) return inline;
   if (bool(args, "stdin")) return new Response(Bun.stdin.stream()).text();
   return undefined;
+}
+
+// ─────────────── публичные ссылки: своя и унаследованные ──────────────
+//
+// Без входа документ открывается своей ссылкой, ссылкой на всю коллекцию или ссылкой
+// на родительский документ, выданной вместе с вложенными. Две последние открывают и другие
+// документы, поэтому по одному документу их не отзывают.
+
+/**
+ * Ссылки из ответа shares.info — единственный разбор этого ответа в скрипте. 1.10.1 отдаёт
+ * { shares: [...] }: по id — саму ссылку, по documentId — свою ссылку документа и одну родительскую,
+ * по collectionId — ссылку коллекции; ссылки нет — 204 без тела. Старые версии — одну ссылку или 404.
+ */
+async function sharesInfo(rm: Resolved, body: Record<string, unknown>): Promise<Share[]> {
+  let data: unknown;
+  try {
+    data = await api<unknown>(rm, "shares.info", body);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return [];
+    throw error;
+  }
+  const list: unknown[] =
+    isRecord(data) && Array.isArray(data.shares) ? data.shares : isRecord(data) && typeof data.id === "string" ? [data] : [];
+  return list.filter((s): s is Share => isRecord(s) && typeof s.id === "string");
+}
+
+/** Чья ссылка открывает документ: его собственная, на всю коллекцию или на предка вместе с вложенными. */
+type LinkVia = "own" | "collection" | "parent";
+type DocumentLink = { via: LinkVia; share: Share };
+
+type DocumentLinks = {
+  /** Своя ссылка документа — в любом состоянии: снятая с публикации тоже существует и отзывается. */
+  own: Share | null;
+  /** Опубликованные ссылки, открывающие документ вместе с другими: на коллекцию и на предков. */
+  inherited: DocumentLink[];
+  /** Почему ссылки коллекции и предков проверены не до конца; нет поля — проверено всё. */
+  unchecked?: string;
+  /** Черновик вне коллекции: его собственную ссылку 1.10.1 по документу не показывает. */
+  ownHidden?: boolean;
+};
+
+/**
+ * Все ссылки, которыми открыт документ. Outline 1.10.1 на shares.info { documentId } отвечает 204,
+ * если своей ссылки у документа нет, — даже когда открыта вся коллекция или родительский документ
+ * вместе с вложенными, — а к своей ссылке добавляет лишь одну родительскую. Поэтому по очереди
+ * проверяются своя ссылка, ссылка на коллекцию и ссылки предков вверх по дереву.
+ * firstOpen — остановиться на первой опубликованной: attach нужно знать только, открыт ли документ.
+ * Сбой на своей ссылке — ошибка команды; сбой дальше — пометка unchecked при том, что уже найдено.
+ */
+async function documentLinks(rm: Resolved, doc: Doc, firstOpen = false): Promise<DocumentLinks> {
+  const links: DocumentLinks = { own: null, inherited: [] };
+  const seen = new Set<string>();
+  // Чужая ссылка открывает документ, если опубликована и выдана на всю коллекцию или на предка
+  // вместе с вложенными: ссылка предка без вложенных открывает только его самого.
+  const take = (share: Share): void => {
+    if (seen.has(share.id) || share.published !== true) return;
+    const via: LinkVia | null = share.collectionId
+      ? "collection"
+      : share.documentId !== doc.id && share.includeChildDocuments === true
+        ? "parent"
+        : null;
+    if (!via) return;
+    seen.add(share.id);
+    links.inherited.push({ via, share });
+  };
+  const enough = (): boolean => firstOpen && (links.own?.published === true || links.inherited.length > 0);
+
+  const first = await sharesInfo(rm, { documentId: doc.id });
+  links.own = first.find((s) => s.documentId === doc.id && !s.collectionId) ?? null;
+  if (links.own) seen.add(links.own.id);
+  first.forEach(take);
+  // У черновика вне коллекции 1.10.1 на shares.info { documentId } отвечает 204, даже если своя
+  // ссылка у него есть («Collection not found for the shared document» превращается в 204).
+  if (!links.own && !doc.collectionId) links.ownHidden = true;
+  if (enough()) return links;
+
+  try {
+    if (doc.collectionId) {
+      (await sharesInfo(rm, { collectionId: doc.collectionId })).forEach(take);
+      if (enough()) return links;
+    }
+    const visited = new Set<string>([doc.id]);
+    let parentId = doc.parentDocumentId ?? null;
+    while (parentId && !visited.has(parentId) && visited.size <= 25) {
+      visited.add(parentId);
+      (await sharesInfo(rm, { documentId: parentId })).forEach(take);
+      if (enough()) return links;
+      parentId = (await loadDoc(rm, parentId)).parentDocumentId ?? null;
+    }
+  } catch (error) {
+    links.unchecked = error instanceof ApiError ? `${error.status} ${error.code}` : networkReason(error);
+  }
+  return links;
+}
+
+/** Название коллекции или документа, который открывает ссылка, — в ёлочках и с пробелом впереди; пусто, если его нет. */
+function quotedTitle(share: Share): string {
+  const name = share.sourceTitle ?? share.documentTitle;
+  return name ? ` «${name}»` : "";
+}
+
+/** Откуда ссылка — словами: своя, на всю коллекцию «…» или на родительский документ «…» с вложенными. */
+function linkOrigin(link: DocumentLink): string {
+  if (link.via === "own") return "своя ссылка";
+  if (link.via === "collection") return `ссылка на всю коллекцию${quotedTitle(link.share)}`;
+  return `ссылка на родительский документ${quotedTitle(link.share)} вместе с вложенными`;
 }
 
 // ─────────────────── вложения: файлы, ссылки, разметка ────────────────
@@ -947,57 +1058,18 @@ async function documentCollection(
 type Exposure = { state: "none" | "public" | "unknown"; detail: string };
 
 /**
- * Опубликованные ссылки из ответа shares.info: 1.10.1 отдаёт { shares: [...] } или 204, если ссылки
- * нет, старые версии — одну ссылку или 404.
- */
-async function publishedShares(rm: Resolved, body: Record<string, unknown>): Promise<Record<string, unknown>[]> {
-  let data: unknown;
-  try {
-    data = await api<unknown>(rm, "shares.info", body);
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 404) return [];
-    throw error;
-  }
-  const list: unknown[] =
-    isRecord(data) && Array.isArray(data.shares) ? data.shares : isRecord(data) && typeof data.id === "string" ? [data] : [];
-  return list.filter((s): s is Record<string, unknown> => isRecord(s) && s.published === true);
-}
-
-/**
- * Открыт ли документ публичной ссылкой. Outline 1.10.1 на shares.info { documentId } отвечает 204,
- * если своей ссылки у документа нет, — даже когда открыта вся коллекция или родительский документ
- * вместе с вложенными. Поэтому по очереди проверяются своя ссылка, ссылка на коллекцию и ссылки
- * родительских документов вверх по дереву. Не удалось проверить — «неизвестно», и планка строгая.
+ * Открыт ли документ публичной ссылкой — своей, на всю коллекцию или на родительский документ
+ * вместе с вложенными (documentLinks). Не удалось проверить — «неизвестно», и планка строгая.
  */
 async function publicExposure(rm: Resolved, doc: Doc): Promise<Exposure> {
-  const found = (share: Record<string, unknown>): Exposure => {
-    const how =
-      share.documentId === doc.id
-        ? "своя ссылка"
-        : typeof share.collectionId === "string" && share.collectionId
-          ? "ссылка на всю коллекцию"
-          : "ссылка на родительский документ вместе с вложенными";
-    return { state: "public", detail: `есть — ${how}` };
-  };
   try {
-    const own = await publishedShares(rm, { documentId: doc.id });
-    const first = own.find((s) => s.documentId === doc.id) ?? own[0];
-    if (first) return found(first);
-    if (doc.collectionId) {
-      const whole = await publishedShares(rm, { collectionId: doc.collectionId });
-      if (whole[0]) return found(whole[0]);
+    const links = await documentLinks(rm, doc, true);
+    const open: DocumentLink | undefined = links.own?.published ? { via: "own", share: links.own } : links.inherited[0];
+    if (open) return { state: "public", detail: `есть — ${linkOrigin(open)}` };
+    if (links.ownHidden) {
+      return { state: "unknown", detail: "проверить не удалось (черновик вне коллекции: Outline не сообщает его ссылку)" };
     }
-    // Ссылка родителя открывает потомков, только если выдана вместе с вложенными документами.
-    const seen = new Set<string>([doc.id]);
-    let parentId = doc.parentDocumentId ?? null;
-    while (parentId && !seen.has(parentId) && seen.size <= 25) {
-      seen.add(parentId);
-      const covering = (await publishedShares(rm, { documentId: parentId })).find(
-        (s) => s.includeChildDocuments === true || (typeof s.collectionId === "string" && s.collectionId !== ""),
-      );
-      if (covering) return found(covering);
-      parentId = (await loadDoc(rm, parentId)).parentDocumentId ?? null;
-    }
+    if (links.unchecked) return { state: "unknown", detail: `проверить не удалось (${links.unchecked})` };
     return { state: "none", detail: "нет" };
   } catch (error) {
     const reason = error instanceof ApiError ? `${error.status} ${error.code}` : networkReason(error);
@@ -1605,12 +1677,17 @@ async function cmdShare(rm: Resolved, args: Args): Promise<void> {
   );
 }
 
+/** Что открывает ссылка — для таблицы: документ по названию или всю коллекцию. */
+function shareSubject(share: Share): string {
+  if (share.collectionId) return `коллекция${quotedTitle(share)}`;
+  return share.sourceTitle ?? share.documentTitle ?? share.documentId ?? "—";
+}
+
 async function cmdShares(rm: Resolved, args: Args): Promise<void> {
   const documentValue = str(args, "document") ?? args.positional[0];
-  const list = documentValue
-    ? [await api<Share>(rm, "shares.info", { documentId: documentRef(documentValue) })].filter(Boolean)
-    : await apiAll<Share>(rm, "shares.list", {}, num(args, "limit") ?? 100);
+  if (documentValue) return cmdDocumentShares(rm, documentValue);
 
+  const list = await apiAll<Share>(rm, "shares.list", {}, num(args, "limit") ?? 100);
   emit(list, () =>
     list.length === 0
       ? "Выданных ссылок нет."
@@ -1621,26 +1698,263 @@ async function cmdShares(rm: Resolved, args: Args): Promise<void> {
             s.published ? "да" : "нет",
             String(s.views ?? 0),
             (s.lastAccessedAt ?? "—").slice(0, 10),
-            clip(s.documentTitle ?? s.documentId, 30),
+            clip(shareSubject(s), 30),
             s.url,
           ]),
         ]),
   );
 }
 
+/**
+ * Все ссылки одного документа: своя и унаследованные — на всю коллекцию и на предков вместе
+ * с вложенными. По документу отзывается только своя; унаследованная — отдельно, по её адресу.
+ */
+async function cmdDocumentShares(rm: Resolved, value: string): Promise<void> {
+  const doc = await loadDoc(rm, value);
+  const links = await documentLinks(rm, doc);
+  const all: DocumentLink[] = links.own ? [{ via: "own", share: links.own }, ...links.inherited] : links.inherited;
+  const whose = (link: DocumentLink): string =>
+    link.via === "own" ? "своя" : `${link.via === "collection" ? "коллекции" : "родителя"}${quotedTitle(link.share)}`;
+  emit(
+    {
+      document: { id: doc.id, title: doc.title, url: docUrl(rm, doc) },
+      shares: all.map((link) => ({ via: link.via, ...link.share })),
+      ownHidden: links.ownHidden ?? false,
+      unchecked: links.unchecked ?? null,
+    },
+    () => {
+      const parts = [`ССЫЛКИ ДОКУМЕНТА «${doc.title || "(без названия)"}» · инстанс ${rm.name}\n${docUrl(rm, doc)}`];
+      if (all.length === 0 && !links.ownHidden) {
+        parts.push(
+          links.unchecked
+            ? "Своей публичной ссылки нет."
+            : "Публичной ссылки нет: ни своей, ни на всю коллекцию, ни на родительский документ.",
+        );
+      } else if (all.length > 0) {
+        parts.push(
+          table([
+            ["ID ССЫЛКИ", "ЧЬЯ", "ПУБЛИЧНА", "ПРОСМОТРОВ", "ПОСЛЕДНИЙ", "URL"],
+            ...all.map((link) => [
+              link.share.id.slice(0, 8),
+              clip(whose(link), 40),
+              link.share.published ? "да" : "нет",
+              String(link.share.views ?? 0),
+              (link.share.lastAccessedAt ?? "—").slice(0, 10),
+              link.share.url,
+            ]),
+          ]),
+        );
+      }
+      if (links.ownHidden) {
+        parts.push(
+          "Своя ссылка не видна: документ — черновик вне коллекции, и Outline не сообщает его ссылку по документу. " +
+            "Если она выдавалась, её отзывают по адресу: outline.ts unshare <адрес ссылки>.",
+        );
+      }
+      if (links.inherited.length > 0) {
+        parts.push(
+          "Ссылка коллекции или родителя открывает и другие документы, поэтому unshare по этому документу " +
+            "её не трогает: она отзывается отдельно, по своему адресу — outline.ts unshare <адрес ссылки>.",
+        );
+      }
+      if (links.unchecked) parts.push(`Ссылки коллекции и родительских документов проверены не до конца: ${links.unchecked}.`);
+      return parts.join("\n\n");
+    },
+  );
+}
+
+type UnshareTarget = { kind: "share"; share: Share } | { kind: "document"; doc: Doc };
+
+/**
+ * Опубликованная ссылка по id или по слагу из адреса …/s/… (shares.info { id }); null — такой нет:
+ * отозвана, снята с публикации или выдана в другом пространстве.
+ */
+async function findShare(rm: Resolved, ref: string): Promise<Share | null> {
+  try {
+    return (await sharesInfo(rm, { id: ref }))[0] ?? null;
+  } catch (error) {
+    // 403 на ссылку по id: она есть, но обмен ссылками выключен в её коллекции или во всём пространстве.
+    if (error instanceof ApiError && error.status === 403) {
+      throw new UserError(
+        `Ссылка ${ref} сейчас не открывается: публичные ссылки запрещены в её коллекции или во всём пространстве. ` +
+          `Убрать её совсем можно по документу: outline.ts unshare <документ>.`,
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * Что отзывать: ссылку (id, адрес …/s/…) или документ (id, urlId, адрес …/doc/… — в том числе документ
+ * внутри чужой ссылки …/s/…/doc/…). Голый uuid бывает и у ссылки, и у документа: сначала он ищется
+ * как ссылка — её id печатает share, — потом как документ.
+ */
+async function unshareTarget(rm: Resolved, value: string): Promise<UnshareTarget> {
+  const trimmed = value.trim();
+  const docInUrl = trimmed.match(/\/doc\/([^/?#]+)/i)?.[1];
+  if (docInUrl) return { kind: "document", doc: await loadDoc(rm, docInUrl) };
+  // Снятую с публикации ссылку shares.info { id } не отдаёт: её находят только по документу.
+  const unpublishedHint = "Снятую с публикации ссылку отзывают по документу: outline.ts unshare <документ>.";
+  const shareInUrl = trimmed.match(/\/s\/([^/?#]+)/i)?.[1];
+  if (shareInUrl) {
+    const share = await findShare(rm, shareInUrl);
+    if (!share) {
+      throw new UserError(
+        `Публичной ссылки ${shareInUrl} нет: она уже отозвана, снята с публикации или выдана в другом пространстве. ` +
+          unpublishedHint,
+      );
+    }
+    return { kind: "share", share };
+  }
+  if (/^https?:\/\//i.test(trimmed)) {
+    throw new UserError(
+      "Адрес не распознан: нужна ссылка …/s/<ссылка>, адрес документа …/doc/<документ> или id. " +
+        "Ссылку на собственном домене отзывайте по документу: outline.ts unshare <документ>.",
+    );
+  }
+  if (!UUID_RE.test(trimmed)) return { kind: "document", doc: await loadDoc(rm, trimmed) };
+  const share = await findShare(rm, trimmed);
+  if (share) return { kind: "share", share };
+  try {
+    return { kind: "document", doc: await loadDoc(rm, trimmed) };
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      throw new UserError(`Ни публичной ссылки, ни документа с id ${trimmed} нет. ${unpublishedHint}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Отозвать публичную ссылку. Названная ссылка (id, адрес …/s/…) отзывается сама. По документу
+ * отзывается только его собственная: ссылка на коллекцию или на родителя вместе с вложенными
+ * открывает и другие документы, поэтому скилл называет её и говорит, где отзывать, но не трогает.
+ * Ссылок нет — так и сказано, а shares.revoke не отправляется.
+ */
 async function cmdUnshare(rm: Resolved, args: Args): Promise<void> {
   const value = args.positional[0] ?? str(args, "id");
-  if (!value) throw new UserError("Укажите ссылку или документ: outline.ts unshare <shareId|docId> --yes");
-  let shareId = value;
-  if (!/^[0-9a-f-]{36}$/i.test(value)) {
-    const info = await api<Share>(rm, "shares.info", { documentId: documentRef(value) });
-    shareId = info.id;
+  if (!value) throw new UserError("Укажите документ или ссылку: outline.ts unshare <docId|shareId|url> [--yes]");
+  const target = await unshareTarget(rm, value);
+  if (target.kind === "share") return revokeShare(rm, args, target.share, null);
+
+  const { doc } = target;
+  const links = await documentLinks(rm, doc);
+  if (links.own) return revokeShare(rm, args, links.own, { doc, links });
+
+  const title = doc.title || "(без названия)";
+  const result = {
+    revoked: null,
+    document: { id: doc.id, title: doc.title, url: docUrl(rm, doc) },
+    inherited: links.inherited.map((link) => ({ via: link.via, id: link.share.id, url: link.share.url })),
+    ownHidden: links.ownHidden ?? false,
+    unchecked: links.unchecked ?? null,
+  };
+  if (links.ownHidden) {
+    // Своя ссылка, может быть, есть, но Outline её по документу не отдаёт: «нет» было бы неправдой.
+    process.exitCode = 1;
+    emit(result, () =>
+      `Документ «${title}» — черновик вне коллекции: его собственную ссылку Outline по документу не сообщает, ` +
+        `поэтому скилл не может ни отозвать её отсюда, ни сказать, что её нет.\n` +
+        `Если ссылка выдавалась, отзовите её по адресу: outline.ts unshare <адрес …/s/…>.`,
+    );
+    return;
   }
-  if (!bool(args, "yes")) {
-    throw new UserError(`Отзыв ссылки необратим. Повторите с --yes: outline.ts unshare ${shareId} --yes`);
+  if (links.inherited.length > 0) {
+    // Документ по-прежнему открыт, а отзывать по нему нечего: просьба не выполнена — код возврата 1.
+    process.exitCode = 1;
+    emit(result, () =>
+      [
+        `У документа «${title}» нет своей публичной ссылки — отзывать по нему нечего. Но без входа в Outline он открыт:`,
+        ...links.inherited.map((link) => `  — ${linkOrigin(link)}: ${link.share.url}`),
+        "Такая ссылка открывает не только этот документ, поэтому скилл её сам не отзывает.",
+        "Чтобы закрыть доступ, отзовите её саму — предпросмотр покажет, что ещё закроется:",
+        ...links.inherited.map((link) => `  outline.ts unshare ${link.share.id}`),
+      ].join("\n"),
+    );
+    return;
   }
-  await api(rm, "shares.revoke", { id: shareId });
-  emit({ revoked: shareId }, () => `Ссылка ${shareId} отозвана: документ больше не доступен по ней.`);
+  if (links.unchecked) {
+    process.exitCode = 1;
+    emit(result, () =>
+      `У документа «${title}» нет своей публичной ссылки. Открыт ли он ссылкой на коллекцию ` +
+        `или на родительский документ, проверить не удалось (${links.unchecked}).`,
+    );
+    return;
+  }
+  emit(result, () =>
+    `Публичной ссылки нет: у документа «${title}» нет своей, и он не открыт ни ссылкой на всю коллекцию, ` +
+      `ни ссылкой на родительский документ. Отзывать нечего.`,
+  );
+}
+
+/**
+ * Предпросмотр и отзыв одной ссылки — протоколом --yes, как любая запись. found — документ, по которому
+ * ссылку нашли, и прочие его ссылки: о тех, что оставят его открытым и после отзыва, сказано прямо.
+ */
+async function revokeShare(
+  rm: Resolved,
+  args: Args,
+  share: Share,
+  found: { doc: Doc; links: DocumentLinks } | null,
+): Promise<void> {
+  // shares.revoke принимает только uuid ссылки: без него Outline отказывает, а слаг из адреса — не id.
+  if (!UUID_RE.test(share.id)) throw new UserError("Outline не назвал id ссылки — отзыв не отправлен.");
+  const remaining = found?.links.inherited ?? [];
+
+  const warnings: string[] = [];
+  if (share.collectionId) warnings.push("это ссылка на всю коллекцию: после отзыва без входа не откроется ни один её документ");
+  if (!share.published) warnings.push("ссылка снята с публикации и сейчас не открывается; отзыв удалит её совсем");
+  for (const link of remaining) {
+    warnings.push(
+      `документ останется открыт: ${linkOrigin(link)} — ${link.share.url}. ` +
+        `Она открывает и другие документы и отзывается отдельно: outline.ts unshare ${link.share.id}`,
+    );
+  }
+  if (found?.links.unchecked) {
+    warnings.push(`открыт ли документ ещё ссылкой коллекции или родителя, проверить не удалось (${found.links.unchecked})`);
+  }
+
+  const preview =
+    `ОТЗЫВ ПУБЛИЧНОЙ ССЫЛКИ · инстанс ${rm.name}\n` +
+    table([
+      ["Ссылка", share.url],
+      [
+        "Открывает",
+        share.collectionId
+          ? `всю коллекцию${quotedTitle(share)}`
+          : `документ${quotedTitle(share)}${share.includeChildDocuments ? " вместе с вложенными" : ""}`,
+      ],
+      ["Состояние", share.published ? "опубликована: открывается без входа в Outline" : "снята с публикации"],
+      ["Просмотров", String(share.views ?? 0)],
+      ["Выдана", [share.createdAt?.slice(0, 10), share.createdBy?.name].filter(Boolean).join(", ") || "—"],
+    ]) +
+    (warnings.length ? `\n\nВнимание:\n${warnings.map((w) => `  — ${w}`).join("\n")}` : "") +
+    `\n\nОтзыв необратим: ${share.published ? "адрес перестанет открываться сразу, " : ""}` +
+    "вернуть его нельзя — только выдать новую ссылку.";
+  if (!requireConfirmation(args, preview)) return;
+
+  try {
+    await api(rm, "shares.revoke", { id: share.id });
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 403) {
+      const who = share.createdBy?.name ? ` (${share.createdBy.name})` : "";
+      throw new UserError(`Outline не дал отозвать ссылку: отзывает тот, кто её выдал${who}, или администратор пространства.`);
+    }
+    throw error;
+  }
+  emit(
+    {
+      revoked: share.id,
+      url: share.url,
+      document: found ? { id: found.doc.id, title: found.doc.title, url: docUrl(rm, found.doc) } : null,
+      stillOpen: remaining.map((link) => ({ via: link.via, id: link.share.id, url: link.share.url })),
+    },
+    () =>
+      [
+        `Ссылка отозвана: ${share.url} больше не открывается.`,
+        ...remaining.map((link) => `Документ по-прежнему открыт: ${linkOrigin(link)} — ${link.share.url}.`),
+      ].join("\n"),
+  );
 }
 
 async function cmdMove(rm: Resolved, args: Args): Promise<void> {
@@ -1940,7 +2254,7 @@ function cmdHelp(): void {
 
 Общие флаги: --instance <имя>  --json  --no-cache
 
-ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: create, update, publish, share, move, archive, delete, attach
+ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: create, update, publish, share, unshare, move, archive, delete, attach
 без --yes печатают полный предпросмотр и ничего не меняют. Текст документа проверяется
 на компрометацию: черновик — по внутренней планке, публикация и ссылка — по клиентской.
 
@@ -1971,8 +2285,10 @@ function cmdHelp(): void {
 
 Ссылки для клиентов
   share <id|url> [--children] [--yes]   выдать публичную ссылку
-  shares [--document <id>]              что выдано: просмотры и последнее обращение
-  unshare <shareId|docId> --yes         отозвать ссылку
+  shares [--document <id|url>]          что выдано: просмотры и последнее обращение; по документу —
+                                        своя ссылка и унаследованные (на коллекцию, на родителя)
+  unshare <docId|shareId|url> [--yes]   отозвать ссылку; по документу — только его собственную,
+                                        унаследованную называет, но не трогает
 
 Проверка текста
   scan (--file f | --text "…") [--audience client|internal]
